@@ -1,45 +1,62 @@
-# TripGo — репозиторий для лабораторных работ
+# TripGo — trip-service
 
-Заготовка курса «Разработка микросервисов на Go». Здесь вы делаете все пять
-работ: каждая следующая продолжает предыдущую, переписывать сервис с нуля не
-нужно.
+Сервис управления поездками (Лабораторная работа 1 курса «Разработка микросервисов на Go»).
 
-## Что делать сразу
+## Требования
+- Go 1.22+
+- PostgreSQL 16+
+- Goose (для применения миграций схемы)
 
-1. **Fork** этого репозитория к себе. Форк нужен, чтобы преподаватели видели
-   список всех работ курса одной страницей.
-2. Заведите модуль:
-
+## Конфигурация
+Создайте локальный конфигурационный файл на основе шаблона:
 ```bash
-git clone git@github.com:<ваш-логин>/<ваш-репозиторий>.git
-cd <ваш-репозиторий>
-go mod init github.com/<ваш-логин>/<ваш-репозиторий>
+cp .env.example .env
 ```
 
-Путь модуля потом не меняется — иначе придётся править все импорты. Проще всего
-взять адрес своего репозитория, каким бы он ни был.
+Параметры окружения:
+- `HTTP_ADDR`: адрес HTTP-сервера (по умолчанию `:8080`)
+- `DATABASE_URL`: строка подключения к PostgreSQL (`postgres://tripgo:tripgo@localhost:5432/tripgo?sslmode=disable`)
 
-Дальше — [`homework/docs/getting-started.md`](https://github.com/course-go-autumn-2026/course/blob/main/homework/docs/getting-started.md)
-в репозитории курса: инструменты, окружение, миграции, вид сданной работы.
+## Миграции базы данных
+Применение миграций схемы поездок:
+```bash
+goose -dir migrations/trip postgres "$DATABASE_URL" up
+```
 
-## Где что лежит
+Откат последней миграции:
+```bash
+goose -dir migrations/trip postgres "$DATABASE_URL" down
+```
 
-| Что | Где |
-|---|---|
-| Задания, документация, контракты | [`course-go-autumn-2026/course`](https://github.com/course-go-autumn-2026/course) |
-| Слайды и записи лекций | [`lections/`](https://github.com/course-go-autumn-2026/course/tree/main/lections) |
-| Как оценивают, дедлайны, порядок сдачи | [`homework/docs/grading.md`](https://github.com/course-go-autumn-2026/course/blob/main/homework/docs/grading.md) |
-| Локальное окружение и утилита `tripgoctl` | [`course-go-autumn-2026/course-infra`](https://github.com/course-go-autumn-2026/course-infra) |
+## Сборка и запуск сервиса
+Компиляция проекта:
+```bash
+go build ./...
+```
 
-Задания появляются по мере курса, каждое — после своей пары лекций.
+Запуск сервиса:
+```bash
+go run ./cmd/trip-service
+```
 
-## Как сдавать
-
-Ветка `homework/NN` от `main`, pull request в `main` своего форка, ссылка
-ментору до дедлайна. Подробно — в `grading.md` репозитория курса.
-
-## Чужие работы
-
-Форки видны всем, включая ваши. Смотреть чужие решения, пока идёт курс, —
-плохая идея: одинаковый код виден сразу, а разбираться на защите придётся
-самому.
+## Проверка работоспособности
+- **Liveness-проба:**
+  ```bash
+  curl -i http://localhost:8080/health
+  ```
+- **Readiness-проба (проверка соединения с PostgreSQL):**
+  ```bash
+  curl -i http://localhost:8080/ready
+  ```
+- **Создание поездки:**
+  ```bash
+  curl -i -X POST http://localhost:8080/api/v1/trips \
+    -H "Content-Type: application/json" \
+    -d '{
+      "user_id": "00000000-0000-0000-0000-000000000001",
+      "driver_id": "00000000-0000-0000-0000-000000000002",
+      "price": 450,
+      "start_point": {"latitude": 59.9343, "longitude": 30.3351},
+      "end_point": {"latitude": 59.9400, "longitude": 30.3400}
+    }'
+  ```
