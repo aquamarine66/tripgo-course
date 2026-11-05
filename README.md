@@ -1,297 +1,185 @@
 # TripGo — trip-service
 
-Сервис управления поездками (лабораторная работа 1 курса «Разработка микросервисов на Go»):
-HTTP API по контракту OpenAPI, хранение в PostgreSQL, собственный менеджер транзакций.
+Сервис управления поездками (курс «Разработка микросервисов на Go», лабораторные работы 1–2):
+HTTP API по контракту OpenAPI, PostgreSQL (`pgxpool` + `squirrel`), контекстный менеджер транзакций,
+многослойная архитектура с контролем зависимостей (`depguard`), модульные и интеграционные тесты,
+структурные логи (`slog`) и телеметрия OpenTelemetry (трейсы в Jaeger, метрики в Prometheus/Grafana).
 
 ## Требования
 
-- Go 1.26+ (версия из `go.mod`; `oapi-codegen` и `goose` подключены как tools модуля
-  и запускаются через `go tool`, ставить их глобально не нужно)
-- [`tripgoctl`](https://github.com/course-go-autumn-2026) — поднимает PostgreSQL
-- `make`, `curl` (и по желанию `jq`) для проверки
+- Go 1.26+ (`oapi-codegen`, `goose` и `mockgen` подключены как `tool`-зависимости в `go.mod` и вызываются через `go tool`)
+- `golangci-lint` v2 (`go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest`)
+- [`tripgoctl`](https://github.com/course-go-autumn-2026) — поднимает PostgreSQL и стек observability (OTel Collector, Jaeger, Prometheus, Grafana)
+- `make`, `curl` (и по желанию `jq`)
 
 ## Запуск из чистого клона
 
 ```bash
 git clone git@github.com:aquamarine66/tripgo-course.git
 cd tripgo-course
-git checkout homework/01
+git checkout homework/02
 
-# 1. окружение: поднимает PostgreSQL и создаёт .env с его адресом
+# 1. Поднять окружение лабораторной 2 (PostgreSQL + OTel Collector + Jaeger + Prometheus + Grafana)
 tripgoctl cluster start          # один раз на машине
-tripgoctl environment start
-tripgoctl connect                # адреса компонентов
+tripgoctl environment start      # создаёт актуальный .env с портами ЛР2
+tripgoctl connect                # печатает адреса БД, OTLP и ссылки на Jaeger / Grafana / Prometheus
 
-# 2. миграции и запуск
+# 2. Накатить миграции и запустить сервис
 make migrate
 make run
-```
-
-`Makefile` подхватывает переменные из `.env`, который создаёт
-`tripgoctl environment start`. Если запускаете без `tripgoctl` — скопируйте
-шаблон и поправьте `DATABASE_URL` под свою базу:
-
-```bash
-cp .env.example .env
 ```
 
 ## Цели Makefile
 
 | Цель | Что делает |
 |---|---|
-| `make generate` | генерирует `internal/api/api.gen.go` из `contracts/openapi/trip-service.openapi.yaml` |
+| `make generate` | генерирует `internal/generated/api.gen.go` из OpenAPI и все `mocks_test.go` через `go generate ./internal/...` |
 | `make migrate` | накатывает все миграции (`goose up`) |
 | `make migrate-down` | откатывает последнюю миграцию (`goose down`) |
-| `make migrate-status` | статус миграций |
-| `make run` | запускает сервис |
+| `make migrate-status` | выводит статус миграций |
+| `make run` | запускает сервис локально |
 | `make build` | собирает бинарь в `bin/trip-service` |
-| `make test` | все тесты с `-race` |
-| `make lint` | `golangci-lint` (нужен установленный бинарь) |
+| `make test` | запускает все unit-тесты с `-race` и печатает покрытие `internal/domain/...` и `internal/usecase/...` |
+| `make test-integration` | запускает интеграционные тесты репозитория и менеджера транзакций (`-tags=integration -race`) на реальном PostgreSQL |
+| `make lint` | запускает `golangci-lint run ./...` с конфигом `.golangci.yml` |
 
 ## Переменные окружения
 
-Все параметры читаются из окружения. Обязательная переменная — `DATABASE_URL`.
-Если переменная задана с некорректным значением (например, `DATABASE_MAX_CONNS=abc`
-или `SHUTDOWN_TIMEOUT=0`), сервис не стартует и пишет, что именно не так.
+Все настройки берутся из переменных окружения (`.env` генерируется `tripgoctl environment start`, шаблон — в `.env.example`). При отсутствии обязательной `DATABASE_URL` или при невалидных значениях чисел/таймаутов сервис завершает старт с ошибкой.
 
 | Переменная | По умолчанию | Описание |
 |---|---|---|
 | `DATABASE_URL` | — (обязательна) | строка подключения к PostgreSQL |
 | `HTTP_ADDR` | `:8080` | адрес HTTP-сервера |
-| `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
+| `LOG_LEVEL` | `info` | уровень логирования (`debug`, `info`, `warn`, `error`) |
 | `SHUTDOWN_TIMEOUT` | `10s` | общий бюджет graceful shutdown |
 | `HTTP_READ_TIMEOUT` | `5s` | `http.Server.ReadTimeout` |
 | `HTTP_READ_HEADER_TIMEOUT` | `2s` | `http.Server.ReadHeaderTimeout` |
 | `HTTP_WRITE_TIMEOUT` | `10s` | `http.Server.WriteTimeout` |
 | `HTTP_IDLE_TIMEOUT` | `120s` | `http.Server.IdleTimeout` |
-| `DATABASE_MAX_CONNS` | `10` | максимум соединений в пуле (≥ 1) |
-| `DATABASE_MIN_CONNS` | `2` | минимум соединений в пуле (≤ `DATABASE_MAX_CONNS`) |
-| `DATABASE_MAX_CONN_LIFETIME` | `30m` | время жизни соединения |
-| `DATABASE_CONNECT_TIMEOUT` | `5s` | таймаут установки соединения и стартового `Ping` |
-| `DATABASE_QUERY_TIMEOUT` | `3s` | таймаут каждого запроса к бд и проверки в `/ready` |
+| `DATABASE_MAX_CONNS` | `10` | максимум соединений в пуле (`>= 1`) |
+| `DATABASE_MIN_CONNS` | `2` | минимум соединений в пуле (`<= DATABASE_MAX_CONNS`) |
+| `DATABASE_MAX_CONN_LIFETIME` | `30m` | максимальное время жизни соединения |
+| `DATABASE_CONNECT_TIMEOUT` | `5s` | таймаут подключения и стартового `Ping` |
+| `DATABASE_QUERY_TIMEOUT` | `3s` | таймаут каждого SQL-запроса и readiness-пробы `/ready` |
+| `OTEL_SERVICE_NAME` | `trip-service` | `service.name` ресурса OpenTelemetry и поле `service` в логах |
+| `OTEL_SERVICE_VERSION` | `0.2.0` | `service.version` ресурса OpenTelemetry |
+| `OTEL_RESOURCE_ATTRIBUTES` | `service.namespace=tripgo,deployment.environment=local` | атрибуты ресурса OTel |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318` | адрес OTLP/HTTP-коллектора |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` | протокол экспорта OTLP |
+| `OTEL_TRACES_SAMPLER` | `parentbased_always_on` | стратегия сэмплирования трейсов |
 
-Полный список переменных курса (для следующих работ) — в `.env.example`.
-
-## Тесты
+## Тесты и линтер
 
 ```bash
+# Линтер (включая проверку архитектурных границ depguard и форматтеры gofumpt/gci)
+make lint
+
+# Unit-тесты (домен, юзкейсы с gomock, маппинг ошибок, HTTP-хендлеры с httptest, middleware)
+# Печатает покрытие пакетов internal/domain и internal/usecase (>= 94–100%)
 make test
-```
 
-Интеграционные тесты менеджера транзакций (откат при ошибке и панике, вложенный
-`Do`, атомарность создания поездки) ходят в настоящую бд и без неё пропускаются.
-Чтобы их запустить, нужна бд с накатанными миграциями:
-
-```bash
+# Интеграционные тесты репозитория и транзакций на реальном PostgreSQL (build tag: integration)
 make migrate
-TEST_DATABASE_URL="$(grep ^DATABASE_URL= .env | cut -d= -f2-)" go test -race -count=1 ./internal/repository/
+make test-integration
 ```
 
-## API
+Каждый интеграционный тест сам создаёт свои записи со случайными UUID и удаляет их в `t.Cleanup`, поэтому тесты изолированы и проходят при повторных запусках (`-count=2`).
 
-Контракт — `contracts/openapi/trip-service.openapi.yaml`. Реализовано в этой работе:
+## Архитектура
 
-| Метод | Путь | Ответы |
-|---|---|---|
-| `POST` | `/api/v1/trips` | `201` + `Location`, `400`, `409`, `500` |
-| `GET` | `/api/v1/trips/{tripId}` | `200`, `400`, `404`, `500` |
-| `POST` | `/api/v1/trips/{tripId}/finish` | `200`, `400`, `404`, `409`, `500` |
-| `GET` | `/health` | `200` |
-| `GET` | `/ready` | `200`, `503` |
+### Слои и структура пакетов
 
-Ручки `/positions` относятся к работе 3 и пока отвечают `501` в формате `problem+json`.
-
-### Проверка
-
-```bash
-curl -i localhost:8080/health
-curl -i localhost:8080/ready
-
-# создание — 201, заголовок Location
-curl -i -X POST localhost:8080/api/v1/trips \
-  -H 'Content-Type: application/json' \
-  -d '{"user_id":"5cb72c04-7650-45c9-a79b-bcdba0631e0c",
-       "driver_id":"8860b315-ec86-42eb-a17c-7c163d721ff5",
-       "start_point":{"latitude":59.9398,"longitude":30.3146},
-       "end_point":{"latitude":59.9290,"longitude":30.3626},
-       "price":1450}'
-
-# повтор на том же водителе — 409 driver_busy
-# получение
-curl -i localhost:8080/api/v1/trips/$TRIP_ID
-# завершение — 200, повторное — 409 trip_completed
-curl -i -X POST localhost:8080/api/v1/trips/$TRIP_ID/finish
-# tripId не UUID — 400 invalid_request
-curl -i localhost:8080/api/v1/trips/not-a-uuid
-```
-
-Гонка на создание — ровно один `201`, остальные `409`:
-
-```bash
-seq 20 | xargs -P20 -I{} curl -s -o /dev/null -w '%{http_code}\n' \
-  -X POST localhost:8080/api/v1/trips -H 'content-type: application/json' \
-  -d @trip.json | sort | uniq -c
-```
-
-### Ошибки
-
-Все ошибки отдаются по RFC 9457 в `application/problem+json` со схемой `Problem`
-из контракта. Для каждого `code` фиксированы `type`, `title` и HTTP-статус:
-
-| HTTP | `code` | Когда |
-|---|---|---|
-| `400` | `invalid_request` | невалидный JSON, нарушение схемы `TripData`, пустой/нулевой UUID, `tripId` не UUID |
-| `404` | `trip_not_found` | поездки с таким `id` нет |
-| `409` | `trip_completed` | повторное завершение поездки |
-| `409` | `driver_busy` | у водителя уже есть активная поездка |
-| `500` | `internal_error` | всё остальное |
-
-## Решения
-
-### Структура
+Код организован по двум принципам: **«пакет на действие, а не файл на слой»** и **«инфраструктура отдельно от бизнес-логики»**:
 
 ```
-cmd/trip-service/       main: конфиг, пул, сборка зависимостей, HTTP-сервер, graceful shutdown
-internal/config/        чтение и проверка переменных окружения
-internal/api/           сгенерированный код (api.gen.go) + хендлеры и problem+json
-internal/service/       бизнес-логика; объявляет нужные ей интерфейсы TxManager и TripRepository
-internal/repository/    pgx + squirrel, менеджер транзакций
-internal/model/         доменные сущности и ошибки
-migrations/             миграции goose
-contracts/              контракты курса (не редактируются)
+cmd/trip-service/                 точка входа: читает конфиг, создаёт container, ждёт сигнала остановки
+internal/
+  config/                         чтение и валидация переменных окружения
+  container/                      composition root: создаёт все реализации и связывает их вручную
+  domain/
+    trip/                         доменная сущность Trip, Coordinates, метод Finish, доменные ошибки и ValidationError
+  model/                          межслойные структуры (Trip, CreateTripInput, StatusChange) и конвертеры в/из домена
+  usecase/
+    trip/
+      create/                     юзкейс создания поездки (usecase.go, contract.go, usecase_test.go, mocks_test.go)
+      get/                        юзкейс получения поездки
+      finish/                     юзкейс завершения поездки
+  http/
+    router.go                     сборка chi-роутера, подключение middleware и сгенерированного ServerInterface
+    domainerror/                  единая точка перевода ошибок в RFC 9457 Problem (application/problem+json)
+    middleware/                   Recover → Tracing → Logging → Metrics
+    trip/
+      create/                     HTTP-хендлер POST /api/v1/trips (handler.go, contract.go, convert.go, тесты и моки)
+      get/                        HTTP-хендлер GET /api/v1/trips/{tripId}
+      finish/                     HTTP-хендлер POST /api/v1/trips/{tripId}/finish
+      response/                   преобразование model.Trip в контрактный JSON-ответ
+  repository/
+    trip/                         PostgreSQL-репозиторий на pgx + squirrel (repo.go, save.go, fetch.go, convert.go, интеграционные тесты)
+  infra/
+    postgres/                     инициализация pgxpool и pgx.QueryTracer для спанов и метрик БД
+      transaction/                контекстный менеджер транзакций (Do)
+    telemetry/                    инициализация OpenTelemetry SDK (OTLP HTTP), метрик и slog JSON-логгера с trace_id/span_id
+  generated/                      сгенерированный oapi-codegen код (api.gen.go)
+migrations/                       SQL-миграции goose
+contracts/                        контракты курса (OpenAPI, schema.md)
 ```
 
-### Менеджер транзакций
+### Направление зависимостей и где объявлены интерфейсы
 
-`repository.TxManager.Do(ctx, fn)`:
-
-- открывает транзакцию (`BeginTx` с явным уровнем изоляции), кладёт `pgx.Tx`
-  в `context` и вызывает `fn` с этим контекстом;
-- `fn` вернула `nil` → `COMMIT`; вернула ошибку → `ROLLBACK` и ошибка
-  пробрасывается наружу (если упал и сам `ROLLBACK`, обе ошибки объединяются
-  через `errors.Join`);
-- `fn` запаниковала → `ROLLBACK` в `defer`/`recover`, после чего паника
-  пробрасывается дальше (её ловит `middleware.Recoverer` и отдаёт `500`).
-  Соединение не остаётся висеть с открытой транзакцией;
-- `ROLLBACK` выполняется с `context.WithoutCancel`, чтобы откат дошёл до бд,
-  даже если контекст запроса уже отменён;
-- **вложенный `Do`**: если в контексте уже есть транзакция, новая не
-  открывается — `fn` выполняется в той же транзакции, а `COMMIT`/`ROLLBACK`
-  делает только внешний `Do`. Ошибка внутреннего вызова откатывает всю
-  внешнюю транзакцию;
-- репозиторий достаёт исполнителя через `getQuerier(ctx)`: есть транзакция
-  в контексте — работает через неё, нет — через пул. Транзакция не передаётся
-  аргументом методов репозитория. Вызов репозитория вне `Do` просто выполняет
-  запрос на пуле в режиме autocommit.
-
-Сервис зависит только от интерфейса `Do(ctx, fn) error`, объявленного в пакете
-`service`: про `pgx`, пулы и транзакции бизнес-код не знает.
-
-Создание поездки — один `Do`: `INSERT` в `trips` и `INSERT` в
-`trip_status_history`. Завершение — тоже один `Do`: `UPDATE trips` и запись
-в журнал. Поведение (откат при ошибке, при панике, вложенный вызов, атомарность
-создания при падении второй вставки) покрыто тестами в
-`internal/repository/tx_manager_test.go`.
-
-### Уровень изоляции: READ COMMITTED
-
-Выбран `READ COMMITTED` (он же значение по умолчанию в PostgreSQL), но задаётся
-явно в `Do`, а не полагается на настройки сервера.
-
-Почему его достаточно:
-
-- инварианты держит сама бд, а не чтение-проверка-запись в коде: запрет двух
-  активных поездок — частичный уникальный индекс, завершение — условный `UPDATE`.
-  Обе гарантии работают на любом уровне изоляции;
-- транзакции короткие: две вставки или `UPDATE` + вставка, без чтений, по
-  результатам которых принимается решение. Аномалии, от которых защищают
-  `REPEATABLE READ`/`SERIALIZABLE` (неповторяемое чтение, write skew), здесь
-  не возникают;
-- на более строгих уровнях конкурентные транзакции получали бы ошибки
-  сериализации (`40001`), и пришлось бы писать повторы — лишняя сложность без
-  выигрыша для этих сценариев.
-
-### Запрет двух активных поездок у водителя
-
-Частичный уникальный индекс в миграции:
-
-```sql
-CREATE UNIQUE INDEX trips_driver_active_uniq ON trips (driver_id) WHERE status = 'active';
+```mermaid
+flowchart TD
+    CMD["cmd/trip-service"] --> CONT["internal/container"]
+    CONT --> HTTP["internal/http/*"]
+    CONT --> UC["internal/usecase/trip/*"]
+    CONT --> REPO["internal/repository/trip"]
+    CONT --> INFRA["internal/infra/*"]
+    HTTP --> UC
+    HTTP --> DOM["internal/domain/trip"]
+    UC --> DOM
+    REPO --> DOM
 ```
 
-Проверка `SELECT` перед `INSERT` не спасает от гонки: оба запроса пройдут её
-раньше, чем любой вставит строку. Индекс же проверяется самой бд при вставке:
-из двух параллельных `INSERT` второй ждёт первый и получает `23505
-unique_violation`. Репозиторий распознаёт код `23505` именно на этом индексе
-(`ConstraintName`) и возвращает доменную ошибку `ErrDriverAlreadyHasActiveTrip`
-→ `409 driver_busy`. Завершённые поездки в индекс не попадают, поэтому после
-завершения водитель может взять новую.
+- **Зависимости направлены строго внутрь:**
+  - `internal/domain/trip` не импортирует ни `net/http`, ни `chi`, ни `pgx`, ни `squirrel`, ни `otel`, ни `internal/generated`.
+  - `internal/usecase/...` зависит только от `internal/domain/trip` и `internal/model` и не знает про HTTP-транспорт, SQL или драйвер БД.
+  - `internal/http/...` не знает про `internal/repository/*` и `internal/infra/*`.
+  - Эти границы автоматически проверяются линтером `depguard` в [`.golangci.yml`](.golangci.yml).
+- **Интерфейсы объявлены на стороне потребителя** в файлах `contract.go` каждого пакета и сделаны неэкспортируемыми:
+  - `internal/usecase/trip/create/contract.go` объявляет только те методы репозитория (`Save`, `AddStatusHistory`), `txManager` (`Do`) и `tripMetrics` (`IncTripCreated`), которые нужны именно созданию поездки;
+  - `internal/usecase/trip/finish/contract.go` объявляет `GetByIDForUpdate`, `Update`, `AddStatusHistory`, `txManager` и `IncTripCompleted`;
+  - `internal/usecase/trip/get/contract.go` объявляет только `GetByID`;
+  - каждый HTTP-хендлер (`internal/http/trip/{create,get,finish}/contract.go`) объявляет свой узкий интерфейс `useCase`.
+- **Почему так:** потребитель сам формулирует минимальный контракт, который ему нужен (Interface Segregation + Dependency Inversion). Моки генерируются `mockgen` через `//go:generate` прямо в `mocks_test.go` рядом с кодом. Когда в лабораторной работе 4 появится второй транспорт (gRPC и консьюмер Kafka), ни домен, ни юзкейсы, ни репозиторий менять не придётся — новые адаптеры просто вызовут существующие юзкейсы.
+- **Единая точка сборки (`internal/container`):** все конкретные реализации (`pgxpool`, `transaction.Manager`, `triprepo.Repository`, телеметрия, юзкейсы, HTTP-хендлеры) создаются и связываются только в `container.New`. В `main.go` остаётся только чтение конфига, вызов `container.New` и `app.Run`. Глобальных синглтонов (`slog.Default()`, глобального пула БД) в бизнес-коде нет.
 
-### Конкурентное завершение поездки
+## Observability (OpenTelemetry, логи, метрики, трейсы)
 
-Статус проверяется условием прямо в `UPDATE`:
+- **Логи (`internal/infra/telemetry/logger.go`, `internal/http/middleware`):**
+  - `log/slog` с JSON-хендлером в `stdout`, уровень задаётся через `LOG_LEVEL`.
+  - Обёртка `traceHandler` автоматически извлекает активный спан из `ctx` и добавляет в каждую запись `trace_id` и `span_id`, а также постоянный атрибут `"service": "trip-service"`.
+  - На каждый HTTP-запрос middleware пишет одну итоговую запись `"msg": "request handled"` с полями `method`, `route` (шаблон маршрута `/api/v1/trips/{tripId}`, без подставленного UUID), `status`, `duration_ms`, `trace_id`, `span_id`. Для `2xx`/`4xx` уровень `INFO`, для `5xx` — `ERROR`.
+  - Бизнес-события (`"trip created"`, `"trip completed"`) логируются на уровне `INFO` внутри соответствующих юзкейсов с `trip_id`, `trace_id` и `span_id`.
+- **Трейсы (`internal/infra/telemetry/otel.go`, `internal/infra/postgres/pool.go`):**
+  - Экспорт по OTLP/HTTP (`otlptracehttp`) в коллектор из `OTEL_EXPORTER_OTLP_ENDPOINT`. При недоступном коллекторе сервис продолжает штатно обслуживать запросы.
+  - Middleware `Tracing` извлекает `W3C TraceContext` из входящих заголовков и открывает корневой серверный спан с именем `{method} {http.route}` (например, `POST /api/v1/trips/{tripId}/finish`).
+  - На уровне пула `pgxpool` подключён `postgres.PoolTracer` (`pgx.QueryTracer`), который автоматически создаёт дочерний спан на каждый SQL-запрос с атрибутами `db.operation.name` (`SELECT`, `INSERT`, `UPDATE`) и `db.collection.name` (`trips`, `trip_status_history`), не загрязняя код репозитория телеметрией.
+- **Метрики (`internal/infra/telemetry/metrics.go`):**
+  - `http.server.request.duration` (histogram, `s`) — лейблы `http.request.method`, `http.route` (шаблон!), `http.response.status_code`.
+  - `http.server.active_requests` (up-down counter) — лейблы `http.request.method`, `http.route`.
+  - `db.client.operation.duration` (histogram, `s`) — лейблы `db.operation.name`, `db.collection.name`, `error.type`.
+  - `tripgo.trips.created` (counter) — количество созданных поездок.
+  - `tripgo.trips.completed` (counter) — количество завершённых поездок.
+  - `tripgo.trips.active` (observable gauge) — текущее число активных поездок.
+- **Порядок HTTP middleware (`internal/http/router.go`):**
+  `Recover → Tracing → Logging → Metrics → роутер`.
 
-```sql
-UPDATE trips SET status = 'completed', finished_at = $1, updated_at = $1
-WHERE id = $2 AND status = 'active'
-RETURNING ...
-```
+## Ключевые технические решения
 
-Второй параллельный `UPDATE` ждёт блокировку строки, после коммита первого
-перечитывает её, условие `status = 'active'` уже не выполняется — обновлено
-0 строк, `finished_at` не перезаписывается. Ноль строк означает «поездки нет»
-или «уже завершена»; это различается дополнительным `SELECT status` →
-`404 trip_not_found` или `409 trip_completed`. Если убрать условие по статусу,
-оба запроса вернут `200`, и второй перезапишет `finished_at` и добавит лишнюю
-запись в журнал.
-
-### Валидация запроса
-
-Тело `POST /api/v1/trips` проверяется до бизнес-логики, по схеме `TripData`
-из спецификации, встроенной в сгенерированный код (`GetSwagger()`, проверка
-через `kin-openapi`). Поэтому валидация всегда совпадает с контрактом:
-
-- отсутствующие обязательные поля (`user_id`, `driver_id`, `start_point`,
-  `end_point`, `price`, `latitude`, `longitude`) → `400`. Без этого отсутствие
-  поля превращалось бы в нулевое значение (`price = 0`, координаты `0,0`);
-- неизвестные поля, в том числе вложенные (`additionalProperties: false`) → `400`;
-- диапазоны координат и `price >= 0` → `400`;
-- после схемы тело разбирается в сгенерированный `TripData` — здесь проверяется
-  формат UUID; пустая строка и нулевой UUID `00000000-...` также отклоняются.
-
-`tripId` в пути разбирает сгенерированный роутер; невалидный UUID уходит в
-`api.ParamErrorHandler` и превращается в `400 invalid_request` в формате
-`problem+json` (по умолчанию сгенерированный код отдаёт `text/plain`).
-
-### Ошибки и внутренние детали
-
-Перевод доменных ошибок в HTTP собран в одном месте — `writeError` в
-`internal/api/problem.go`. Неизвестная ошибка логируется целиком (`slog`),
-а клиенту уходит только `500 internal_error` с текстом «Internal server error»:
-тексты ошибок бд и SQL наружу не попадают.
-
-### Работа с бд
-
-- `pgxpool`, параметры пула и таймауты — из env; стартовый `Ping` с
-  `DATABASE_CONNECT_TIMEOUT`, при недоступности бд сервис не стартует;
-- SQL строится `squirrel` с плейсхолдерами `$N`, все значения параметризованы;
-- каждый запрос выполняется с таймаутом `DATABASE_QUERY_TIMEOUT`, `/ready`
-  пингует бд с тем же таймаутом;
-- схема — строго по `contracts/schema.md` (имена колонок, `BIGINT` для цены,
-  `created_at`/`updated_at`, `from_status`/`to_status`/`reason` в журнале,
-  индексы). `last_position_at` появится отдельной миграцией в работе 3.
-
-### `/health` и `/ready`
-
-`/health` — liveness: отвечает `200`, пока жив процесс, и в бд не ходит —
-иначе при недоступной бд оркестратор начал бы перезапускать здоровые поды,
-что не помогает. `/ready` — readiness: пингует бд и при её недоступности
-отвечает `503`, чтобы на под временно не слали трафик. Обе ручки отвечают
-`application/json` со схемой `HealthResponse`.
-
-### Graceful shutdown
-
-По `SIGINT`/`SIGTERM` сервер перестаёт принимать новые соединения и дожидается
-текущих запросов (`http.Server.Shutdown`) в пределах `SHUTDOWN_TIMEOUT`; по
-истечении бюджета соединения закрываются принудительно с записью в лог. После
-этого закрывается пул бд.
+- **Менеджер транзакций и уровень изоляции `READ COMMITTED`:**
+  `transaction.Manager.Do(ctx, fn)` открывает транзакцию с явным уровнем `pgx.ReadCommitted`, кладёт `pgx.Tx` в `context.Context` и выполняет `fn`. При `nil` делается `COMMIT`, при ошибке или панике — `ROLLBACK` (с `context.WithoutCancel(ctx)`, чтобы откат дошёл до БД даже при отмене клиентского контекста), после чего ошибка или паника пробрасывается наружу. Вложенный `Do` обнаруживает уже открытую транзакцию в контексте и переиспользует её. Уровень `READ COMMITTED` выбран потому, что конкурентные инварианты защищены на уровне самой БД (частичный уникальный индекс при создании и `SELECT ... FOR UPDATE` при завершении), которые надёжно работают на `READ COMMITTED` и не требуют `SERIALIZABLE` с ретраями ошибок сериализации `40001`.
+- **Защита от гонок при создании и завершении поездки:**
+  - *Создание:* частичный уникальный индекс `CREATE UNIQUE INDEX trips_driver_active_uniq ON trips (driver_id) WHERE status = 'active'` гарантирует, что из двух параллельных запросов на одного водителя один получит `23505 unique_violation` → `domaintrip.ErrDriverBusy` → `409 driver_busy`.
+  - *Завершение:* внутри транзакции `finish.UseCase` читает строку через `SELECT ... FROM trips WHERE id = $1 FOR UPDATE` (`GetByIDForUpdate`), блокируя её для параллельных `finish`, затем вызывает доменный метод `entity.Finish(now)` (который проверяет `Status == StatusActive` и иначе возвращает `domaintrip.ErrTripCompleted` → `409 trip_completed`), обновляет строку и пишет переход в `trip_status_history`.
+- **Единый маппинг ошибок (`internal/http/domainerror`):**
+  Все хендлеры передают любую ошибку в `domainerror.Write(w, r, logger, err)`. Функция `domainerror.Problem` в одном `switch` переводит `ValidationError`/`InvalidParamFormatError` → `400 invalid_request`, `ErrTripNotFound` → `404 trip_not_found`, `ErrTripCompleted` → `409 trip_completed`, `ErrDriverBusy` → `409 driver_busy`, а любую неизвестную ошибку логирует на уровне `ERROR` и отдаёт клиенту как `500 internal_error` с безопасным текстом `"Internal server error"` без утечки деталей SQL или драйвера.

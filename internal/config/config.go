@@ -6,34 +6,45 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
+// Config — конфигурация сервиса, загружаемая исключительно из переменных окружения.
 type Config struct {
 	HTTPAddr        string
 	DatabaseURL     string
 	LogLevel        string
 	ShutdownTimeout time.Duration
 
-	// таймауты HTTP-сервера
+	// Таймауты HTTP-сервера.
 	HTTPReadTimeout       time.Duration
 	HTTPReadHeaderTimeout time.Duration
 	HTTPWriteTimeout      time.Duration
 	HTTPIdleTimeout       time.Duration
 
-	// настройки пула соединений БД
+	// Настройки пула соединений PostgreSQL.
 	DBMaxConns        int32
 	DBMinConns        int32
 	DBConnectTimeout  time.Duration
 	DBQueryTimeout    time.Duration
 	DBMaxConnLifetime time.Duration
+
+	// Настройки OpenTelemetry (ЛР2).
+	OTelServiceName      string
+	OTelServiceVersion   string
+	OTelServiceNamespace string
+	OTelEnvironment      string
+	OTelExporterEndpoint string
+	OTelExporterProtocol string
+	OTelTracesSampler    string
 }
 
-// Load читает конфигурацию из окружения. Обязательные переменные должны быть
-// заданы, а заданные значения — корректны: при опечатке в значении сервис
-// не стартует молча со значением по умолчанию, а падает с понятной ошибкой.
+// Load читает конфигурацию из окружения и проверяет обязательные и числовые параметры.
 func Load() (*Config, error) {
 	p := &parser{}
+
+	ns, env := parseResourceAttributes(os.Getenv("OTEL_RESOURCE_ATTRIBUTES"))
 
 	cfg := &Config{
 		HTTPAddr:        p.str("HTTP_ADDR", ":8080"),
@@ -51,6 +62,14 @@ func Load() (*Config, error) {
 		DBConnectTimeout:  p.duration("DATABASE_CONNECT_TIMEOUT", 5*time.Second),
 		DBQueryTimeout:    p.duration("DATABASE_QUERY_TIMEOUT", 3*time.Second),
 		DBMaxConnLifetime: p.duration("DATABASE_MAX_CONN_LIFETIME", 30*time.Minute),
+
+		OTelServiceName:      p.str("OTEL_SERVICE_NAME", "trip-service"),
+		OTelServiceVersion:   p.str("OTEL_SERVICE_VERSION", "0.2.0"),
+		OTelServiceNamespace: ns,
+		OTelEnvironment:      env,
+		OTelExporterEndpoint: os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+		OTelExporterProtocol: p.str("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"),
+		OTelTracesSampler:    p.str("OTEL_TRACES_SAMPLER", "parentbased_always_on"),
 	}
 
 	if cfg.DBMaxConns < 1 {
@@ -71,7 +90,28 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
-// parser копит ошибки, чтобы сообщить обо всех неверных переменных сразу.
+func parseResourceAttributes(raw string) (namespace, environment string) {
+	namespace = "tripgo"
+	environment = "local"
+	for _, pair := range strings.Split(raw, ",") {
+		k, v, ok := strings.Cut(strings.TrimSpace(pair), "=")
+		if !ok {
+			continue
+		}
+		switch strings.TrimSpace(k) {
+		case "service.namespace":
+			if v != "" {
+				namespace = strings.TrimSpace(v)
+			}
+		case "deployment.environment":
+			if v != "" {
+				environment = strings.TrimSpace(v)
+			}
+		}
+	}
+	return namespace, environment
+}
+
 type parser struct {
 	errs []error
 }
@@ -115,8 +155,6 @@ func (p *parser) int32(key string, def int32) int32 {
 	return int32(n)
 }
 
-// duration разбирает положительную длительность: нулевой или отрицательный
-// таймаут означал бы «без таймаута» либо мгновенную ошибку.
 func (p *parser) duration(key string, def time.Duration) time.Duration {
 	v := os.Getenv(key)
 	if v == "" {
