@@ -51,6 +51,7 @@ func main() {
 	poolCfg.MaxConns = cfg.DBMaxConns
 	poolCfg.MinConns = cfg.DBMinConns
 	poolCfg.MaxConnLifetime = cfg.DBMaxConnLifetime
+	poolCfg.ConnConfig.ConnectTimeout = cfg.DBConnectTimeout
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
@@ -69,9 +70,13 @@ func main() {
 
 	// сборка слоёв Clean Architecture
 	txManager := repository.NewTxManager(pool)
-	tripRepo := repository.NewTripRepository(pool)
+	tripRepo := repository.NewTripRepository(pool, cfg.DBQueryTimeout)
 	tripService := service.NewTripService(tripRepo, txManager)
-	tripHandler := api.NewTripHandler(tripService, pool)
+	tripHandler, err := api.NewTripHandler(tripService, pool, cfg.DBQueryTimeout)
+	if err != nil {
+		slog.Error("failed to create http handler", "error", err)
+		os.Exit(1)
+	}
 
 	// роутер chi и middleware
 	r := chi.NewRouter()
@@ -81,15 +86,20 @@ func main() {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(cfg.DBQueryTimeout + 2*time.Second))
 
-	// регистрация сгенерированного роутинга
-	api.HandlerFromMux(tripHandler, r)
+	// регистрация сгенерированного роутинга; ошибки разбора параметров
+	// (например, tripId не UUID) отдаются в формате problem+json
+	api.HandlerWithOptions(tripHandler, api.ChiServerOptions{
+		BaseRouter:       r,
+		ErrorHandlerFunc: api.ParamErrorHandler,
+	})
 
 	server := &http.Server{
-		Addr:         cfg.HTTPAddr,
-		Handler:      r,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:              cfg.HTTPAddr,
+		Handler:           r,
+		ReadTimeout:       cfg.HTTPReadTimeout,
+		ReadHeaderTimeout: cfg.HTTPReadHeaderTimeout,
+		WriteTimeout:      cfg.HTTPWriteTimeout,
+		IdleTimeout:       cfg.HTTPIdleTimeout,
 	}
 
 	serverErrors := make(chan error, 1)
@@ -112,7 +122,7 @@ func main() {
 		defer cancel()
 
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			slog.Error("forced shutdown", "error", err)
+			slog.Error("graceful shutdown timed out, forcing close", "error", err)
 			_ = server.Close()
 		}
 		slog.Info("service exited cleanly")

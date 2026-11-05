@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	sq "github.com/Masterminds/squirrel"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -14,49 +16,60 @@ import (
 	"github.com/aquamarine66/tripgo-course/internal/model"
 )
 
-type TripRepository interface {
-	CreateTrip(ctx context.Context, trip *model.Trip) error
-	AddStatusHistory(ctx context.Context, tripID uuid.UUID, status string, changedAt time.Time) error
-	GetTripByID(ctx context.Context, id uuid.UUID) (*model.Trip, error)
-	FinishTrip(ctx context.Context, id uuid.UUID, finishedAt time.Time) error
+// pgUniqueViolation — код ошибки PostgreSQL unique_violation.
+const pgUniqueViolation = "23505"
+
+// driverActiveTripIndex — частичный уникальный индекс из миграции 00001,
+// запрещающий водителю иметь больше одной активной поездки.
+const driverActiveTripIndex = "trips_driver_active_uniq"
+
+// psql — билдер squirrel с плейсхолдерами $N для PostgreSQL.
+var psql = sq.StatementBuilder.PlaceholderFormat(sq.Dollar)
+
+var tripColumns = []string{
+	"id", "user_id", "driver_id", "status", "price",
+	"start_latitude", "start_longitude", "end_latitude", "end_longitude",
+	"started_at", "finished_at", "created_at", "updated_at",
 }
 
-type tripRepository struct {
-	pool *pgxpool.Pool
+type TripRepository struct {
+	pool         *pgxpool.Pool
+	queryTimeout time.Duration
 }
 
-func NewTripRepository(pool *pgxpool.Pool) TripRepository {
-	return &tripRepository{pool: pool}
+// NewTripRepository создаёт репозиторий. queryTimeout ограничивает время
+// выполнения каждого запроса к бд (DATABASE_QUERY_TIMEOUT).
+func NewTripRepository(pool *pgxpool.Pool, queryTimeout time.Duration) *TripRepository {
+	return &TripRepository{pool: pool, queryTimeout: queryTimeout}
 }
 
-func (r *tripRepository) CreateTrip(ctx context.Context, trip *model.Trip) error {
-	q := getQuerier(ctx, r.pool)
+func (r *TripRepository) CreateTrip(ctx context.Context, trip *model.Trip) error {
+	ctx, cancel := context.WithTimeout(ctx, r.queryTimeout)
+	defer cancel()
 
-	query := `
-		INSERT INTO trips (
-			id, user_id, driver_id, status, price,
-			start_lat, start_lng, end_lat, end_lng,
-			started_at, finished_at, last_position_at
-		) VALUES (
-			$1, $2, $3, $4, $5,
-			$6, $7, $8, $9,
-			$10, $11, $12
-		)
-	`
+	query, args, err := psql.Insert("trips").
+		Columns(
+			"id", "user_id", "driver_id", "status", "price",
+			"start_latitude", "start_longitude", "end_latitude", "end_longitude",
+			"started_at", "finished_at",
+		).
+		Values(
+			trip.ID, trip.UserID, trip.DriverID, trip.Status, trip.Price,
+			trip.StartLat, trip.StartLng, trip.EndLat, trip.EndLng,
+			trip.StartedAt, trip.FinishedAt,
+		).
+		Suffix("RETURNING created_at, updated_at").
+		ToSql()
+	if err != nil {
+		return fmt.Errorf("build insert trip query: %w", err)
+	}
 
-	_, err := q.Exec(ctx, query,
-		trip.ID, trip.UserID, trip.DriverID, trip.Status, trip.Price,
-		trip.StartLat, trip.StartLng, trip.EndLat, trip.EndLng,
-		trip.StartedAt, trip.FinishedAt, trip.LastPositionAt,
-	)
-
+	err = getQuerier(ctx, r.pool).QueryRow(ctx, query, args...).Scan(&trip.CreatedAt, &trip.UpdatedAt)
 	if err != nil {
 		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) {
-			// код 23505 — unique_violation (сработал частичный индекс idx_trips_driver_active)
-			if pgErr.Code == "23505" {
-				return model.ErrDriverAlreadyHasActiveTrip
-			}
+		// 23505 на частичном индексе — у водителя уже есть активная поездка
+		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation && pgErr.ConstraintName == driverActiveTripIndex {
+			return model.ErrDriverAlreadyHasActiveTrip
 		}
 		return fmt.Errorf("insert trip: %w", err)
 	}
@@ -64,43 +77,38 @@ func (r *tripRepository) CreateTrip(ctx context.Context, trip *model.Trip) error
 	return nil
 }
 
-func (r *tripRepository) AddStatusHistory(ctx context.Context, tripID uuid.UUID, status string, changedAt time.Time) error {
-	q := getQuerier(ctx, r.pool)
+func (r *TripRepository) AddStatusHistory(ctx context.Context, change model.StatusChange) error {
+	ctx, cancel := context.WithTimeout(ctx, r.queryTimeout)
+	defer cancel()
 
-	query := `
-		INSERT INTO trip_status_history (trip_id, status, changed_at)
-		VALUES ($1, $2, $3)
-	`
-
-	_, err := q.Exec(ctx, query, tripID, status, changedAt)
+	query, args, err := psql.Insert("trip_status_history").
+		Columns("trip_id", "from_status", "to_status", "reason", "changed_at").
+		Values(change.TripID, change.FromStatus, change.ToStatus, change.Reason, change.ChangedAt).
+		ToSql()
 	if err != nil {
+		return fmt.Errorf("build insert status history query: %w", err)
+	}
+
+	if _, err := getQuerier(ctx, r.pool).Exec(ctx, query, args...); err != nil {
 		return fmt.Errorf("insert status history: %w", err)
 	}
 
 	return nil
 }
 
-func (r *tripRepository) GetTripByID(ctx context.Context, id uuid.UUID) (*model.Trip, error) {
-	q := getQuerier(ctx, r.pool)
+func (r *TripRepository) GetTripByID(ctx context.Context, id uuid.UUID) (*model.Trip, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.queryTimeout)
+	defer cancel()
 
-	query := `
-		SELECT 
-			id, user_id, driver_id, status, price,
-			start_lat, start_lng, end_lat, end_lng,
-			started_at, finished_at, last_position_at
-		FROM trips
-		WHERE id = $1
-	`
+	query, args, err := psql.Select(tripColumns...).
+		From("trips").
+		Where(sq.Eq{"id": id}).
+		ToSql()
+	if err != nil {
+		return nil, fmt.Errorf("build select trip query: %w", err)
+	}
 
-	row := q.QueryRow(ctx, query, id)
-
-	var t model.Trip
-	err := row.Scan(
-		&t.ID, &t.UserID, &t.DriverID, &t.Status, &t.Price,
-		&t.StartLat, &t.StartLng, &t.EndLat, &t.EndLng,
-		&t.StartedAt, &t.FinishedAt, &t.LastPositionAt,
-	)
-
+	t, err := scanTrip(getQuerier(ctx, r.pool).QueryRow(ctx, query, args...))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, model.ErrTripNotFound
@@ -108,41 +116,71 @@ func (r *tripRepository) GetTripByID(ctx context.Context, id uuid.UUID) (*model.
 		return nil, fmt.Errorf("select trip by id: %w", err)
 	}
 
-	return &t, nil
+	return t, nil
 }
 
-func (r *tripRepository) FinishTrip(ctx context.Context, id uuid.UUID, finishedAt time.Time) error {
+// FinishTrip атомарно переводит поездку active → completed. Статус проверяется
+// условием прямо в UPDATE, поэтому между проверкой и записью нет окна для
+// параллельного запроса: из двух одновременных вызовов строку обновит только
+// один, второй получит 0 затронутых строк.
+func (r *TripRepository) FinishTrip(ctx context.Context, id uuid.UUID, finishedAt time.Time) (*model.Trip, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.queryTimeout)
+	defer cancel()
+
 	q := getQuerier(ctx, r.pool)
 
-	// атомарно завершаем поездку только если она находится в статусе 'active'
-	query := `
-		UPDATE trips
-		SET status = $1, finished_at = $2
-		WHERE id = $3 AND status = $4
-	`
-
-	cmdTag, err := q.Exec(ctx, query, model.StatusCompleted, finishedAt, id, model.StatusActive)
+	query, args, err := psql.Update("trips").
+		Set("status", model.StatusCompleted).
+		Set("finished_at", finishedAt).
+		Set("updated_at", finishedAt).
+		Where(sq.Eq{"id": id, "status": model.StatusActive}).
+		Suffix("RETURNING " + strings.Join(tripColumns, ", ")).
+		ToSql()
 	if err != nil {
-		return fmt.Errorf("finish trip: %w", err)
+		return nil, fmt.Errorf("build finish trip query: %w", err)
 	}
 
-	// если ни одна строка не обновилась, проверяем причину (не найдена или уже завершена)
-	if cmdTag.RowsAffected() == 0 {
-		var status string
-		checkErr := q.QueryRow(ctx, `SELECT status FROM trips WHERE id = $1`, id).Scan(&status)
-		if checkErr != nil {
-			if errors.Is(checkErr, pgx.ErrNoRows) {
-				return model.ErrTripNotFound
-			}
-			return fmt.Errorf("check trip status: %w", checkErr)
-		}
-
-		if status == model.StatusCompleted {
-			return model.ErrTripAlreadyFinished
-		}
-
-		return model.ErrTripNotFound
+	t, err := scanTrip(q.QueryRow(ctx, query, args...))
+	if err == nil {
+		return t, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("finish trip: %w", err)
 	}
 
-	return nil
+	// ни одна строка не обновилась: различаем «поездки нет» и «уже завершена»
+	checkQuery, checkArgs, err := psql.Select("status").
+		From("trips").
+		Where(sq.Eq{"id": id}).
+		ToSql()
+	if err != nil {
+		return nil, fmt.Errorf("build check trip status query: %w", err)
+	}
+
+	var status string
+	if err := q.QueryRow(ctx, checkQuery, checkArgs...).Scan(&status); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, model.ErrTripNotFound
+		}
+		return nil, fmt.Errorf("check trip status: %w", err)
+	}
+
+	if status == model.StatusCompleted {
+		return nil, model.ErrTripAlreadyFinished
+	}
+
+	return nil, fmt.Errorf("finish trip: unexpected status %q", status)
+}
+
+func scanTrip(row pgx.Row) (*model.Trip, error) {
+	var t model.Trip
+	err := row.Scan(
+		&t.ID, &t.UserID, &t.DriverID, &t.Status, &t.Price,
+		&t.StartLat, &t.StartLng, &t.EndLat, &t.EndLng,
+		&t.StartedAt, &t.FinishedAt, &t.CreatedAt, &t.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
 }

@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
@@ -18,31 +19,54 @@ type PgxQuerier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-type TxManager interface {
-	WithinTransaction(ctx context.Context, fn func(ctx context.Context) error) error
+// TxManager управляет транзакциями так, что бизнес-код ничего не знает о pgx:
+// транзакция живёт в context и достаётся репозиториями через getQuerier.
+type TxManager struct {
+	pool     *pgxpool.Pool
+	isoLevel pgx.TxIsoLevel
 }
 
-type txManager struct {
-	pool *pgxpool.Pool
+// NewTxManager создаёт менеджер транзакций с уровнем изоляции READ COMMITTED.
+func NewTxManager(pool *pgxpool.Pool) *TxManager {
+	return &TxManager{
+		pool:     pool,
+		isoLevel: pgx.ReadCommitted,
+	}
 }
 
-func NewTxManager(pool *pgxpool.Pool) TxManager {
-	return &txManager{pool: pool}
-}
+// Do запускает fn внутри транзакции.
+//
+//   - fn вернула nil → COMMIT;
+//   - fn вернула ошибку → ROLLBACK, ошибка пробрасывается наружу;
+//   - fn запаниковала → ROLLBACK, паника пробрасывается дальше;
+//   - если в ctx уже есть транзакция (вложенный Do), fn выполняется в ней же,
+//     новая транзакция не открывается, а commit/rollback делает внешний Do.
+func (m *TxManager) Do(ctx context.Context, fn func(ctx context.Context) error) (err error) {
+	if _, ok := ctx.Value(txKey{}).(pgx.Tx); ok {
+		return fn(ctx)
+	}
 
-// WithinTransaction запускает функцию внутри транзакции. 
-// если fn вернет ошибку, то транзакция откатится,а иначе — зафиксируется.
-func (m *txManager) WithinTransaction(ctx context.Context, fn func(ctx context.Context) error) error {
-	tx, err := m.pool.Begin(ctx)
+	tx, err := m.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: m.isoLevel})
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
 
-	txCtx := context.WithValue(ctx, txKey{}, tx)
+	// откат выполняем с контекстом без отмены: если контекст запроса уже
+	// отменён (таймаут, клиент ушёл), ROLLBACK всё равно должен дойти до бд
+	rollback := func() error {
+		return tx.Rollback(context.WithoutCancel(ctx))
+	}
 
-	if err := fn(txCtx); err != nil {
-		if rbErr := tx.Rollback(ctx); rbErr != nil {
-			return fmt.Errorf("tx err: %v, rollback err: %w", err, rbErr)
+	defer func() {
+		if p := recover(); p != nil {
+			_ = rollback()
+			panic(p)
+		}
+	}()
+
+	if err := fn(context.WithValue(ctx, txKey{}, tx)); err != nil {
+		if rbErr := rollback(); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
+			return errors.Join(err, fmt.Errorf("rollback transaction: %w", rbErr))
 		}
 		return err
 	}
