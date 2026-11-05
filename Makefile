@@ -5,11 +5,12 @@ export
 
 MIGRATIONS_DIR := migrations
 
-.PHONY: generate migrate migrate-down migrate-status run build test lint tidy check-db-url
+.PHONY: generate migrate migrate-down migrate-status run build test test-integration lint tidy check-db-url
 
-## generate: кодогенерация по OpenAPI (internal/api/api.gen.go)
+## generate: кодогенерация по OpenAPI (internal/generated/api.gen.go) и моки gomock
 generate:
 	go tool oapi-codegen -config contracts/openapi/oapi-codegen.yaml contracts/openapi/trip-service.openapi.yaml
+	go generate ./internal/...
 
 ## migrate: накатить все миграции
 migrate: check-db-url
@@ -31,11 +32,17 @@ run:
 build:
 	go build -o bin/trip-service ./cmd/trip-service
 
-## test: все тесты с -race
+## test: все unit-тесты с -race и выводом итогового покрытия domain и usecase
 test:
-	go test -race ./...
+	go test -race -coverprofile=coverage.out ./...
+	@go tool cover -func=coverage.out | grep -E '(internal/domain|internal/usecase|total:)'
+	@rm -f coverage.out
 
-## lint: golangci-lint (обязателен с ЛР2)
+## test-integration: интеграционные тесты репозитория на реальном PostgreSQL
+test-integration: check-db-url
+	go test -race -tags=integration -v ./internal/repository/...
+
+## lint: golangci-lint
 lint:
 	golangci-lint run ./...
 
