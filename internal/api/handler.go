@@ -18,19 +18,19 @@ import (
 	"github.com/aquamarine66/tripgo-course/internal/service"
 )
 
-// maxBodyBytes ограничивает размер тела запроса.
+// ограничиваем размер тела запроса до 1 мб
 const maxBodyBytes = 1 << 20
 
 var _ ServerInterface = (*TripHandler)(nil)
 
-// TripService — то, что хендлеру нужно от бизнес-логики.
+// интерфейс бизнес-логики поездок для хендлера
 type TripService interface {
 	CreateTrip(ctx context.Context, in service.CreateTripInput) (*model.Trip, error)
 	GetTrip(ctx context.Context, id uuid.UUID) (*model.Trip, error)
 	FinishTrip(ctx context.Context, id uuid.UUID) (*model.Trip, error)
 }
 
-// Pinger — проверка доступности бд для /ready.
+// проверка доступности базы для /ready
 type Pinger interface {
 	Ping(ctx context.Context) error
 }
@@ -42,11 +42,9 @@ type TripHandler struct {
 	tripDataSchema *openapi3.Schema
 }
 
-// NewTripHandler создаёт хендлер. Схема тела запроса TripData берётся из
-// встроенной в сгенерированный код спецификации OpenAPI, поэтому валидация
-// (обязательные поля, неизвестные поля, диапазоны) всегда совпадает с контрактом.
+// создаёт хендлер и достаёт схему TripData из встроенного openapi для валидации запросов
 func NewTripHandler(svc TripService, db Pinger, readyTimeout time.Duration) (*TripHandler, error) {
-	spec, err := GetSwagger()
+	spec, err := GetSpec()
 	if err != nil {
 		return nil, fmt.Errorf("load openapi spec: %w", err)
 	}
@@ -64,7 +62,7 @@ func NewTripHandler(svc TripService, db Pinger, readyTimeout time.Duration) (*Tr
 	}, nil
 }
 
-// CreateTrip (POST /api/v1/trips)
+// создание новой поездки (POST /api/v1/trips)
 func (h *TripHandler) CreateTrip(w http.ResponseWriter, r *http.Request, _ CreateTripParams) {
 	body, err := h.decodeTripData(w, r)
 	if err != nil {
@@ -90,7 +88,7 @@ func (h *TripHandler) CreateTrip(w http.ResponseWriter, r *http.Request, _ Creat
 	writeJSON(w, http.StatusCreated, mapTripToDTO(trip))
 }
 
-// GetTrip (GET /api/v1/trips/{tripId})
+// получение поездки по id (GET /api/v1/trips/{tripId})
 func (h *TripHandler) GetTrip(w http.ResponseWriter, r *http.Request, tripId TripId) {
 	trip, err := h.service.GetTrip(r.Context(), tripId)
 	if err != nil {
@@ -101,7 +99,7 @@ func (h *TripHandler) GetTrip(w http.ResponseWriter, r *http.Request, tripId Tri
 	writeJSON(w, http.StatusOK, mapTripToDTO(trip))
 }
 
-// FinishTrip (POST /api/v1/trips/{tripId}/finish)
+// завершение поездки (POST /api/v1/trips/{tripId}/finish)
 func (h *TripHandler) FinishTrip(w http.ResponseWriter, r *http.Request, tripId TripId) {
 	trip, err := h.service.FinishTrip(r.Context(), tripId)
 	if err != nil {
@@ -112,22 +110,22 @@ func (h *TripHandler) FinishTrip(w http.ResponseWriter, r *http.Request, tripId 
 	writeJSON(w, http.StatusOK, mapTripToDTO(trip))
 }
 
-// ListTripPositions (GET /api/v1/trips/{tripId}/positions) — появится в лабораторной 3
+// заглушка под ручку маршрута, сама логика будет в третьей лабе
 func (h *TripHandler) ListTripPositions(w http.ResponseWriter, r *http.Request, _ TripId) {
 	writeProblem(w, r, problemNotImplemented, "Trip positions are not implemented yet")
 }
 
-// CreateTripPosition (POST /api/v1/trips/{tripId}/positions) — появится в лабораторной 3
+// заглушка под сохранение координат, появится в третьей лабе
 func (h *TripHandler) CreateTripPosition(w http.ResponseWriter, r *http.Request, _ TripId) {
 	writeProblem(w, r, problemNotImplemented, "Trip positions are not implemented yet")
 }
 
-// Health (GET /health) — Liveness-проба, в бд не ходит
+// liveness-проба, в базу не ходит (GET /health)
 func (h *TripHandler) Health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, HealthResponse{Status: Ok})
 }
 
-// Ready (GET /ready) — Readiness-проба с проверкой подключения к базе данных
+// readiness-проба, пингует базу с таймаутом (GET /ready)
 func (h *TripHandler) Ready(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), h.readyTimeout)
 	defer cancel()
@@ -140,9 +138,7 @@ func (h *TripHandler) Ready(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, HealthResponse{Status: Ok})
 }
 
-// decodeTripData читает и валидирует тело запроса на создание поездки.
-// Возвращаемая ошибка содержит только описание проблемы во входных данных,
-// её безопасно показывать клиенту.
+// читает и валидирует тело запроса создания поездки, текст ошибки безопасен для клиента
 func (h *TripHandler) decodeTripData(w http.ResponseWriter, r *http.Request) (*TripData, error) {
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
@@ -153,19 +149,18 @@ func (h *TripHandler) decodeTripData(w http.ResponseWriter, r *http.Request) (*T
 		return nil, errors.New("failed to read request body")
 	}
 
-	// 1. синтаксис JSON
+	// проверяем, что пришёл валидный json
 	var generic any
 	if err := json.Unmarshal(raw, &generic); err != nil {
 		return nil, errors.New("request body must be valid JSON")
 	}
 
-	// 2. схема из контракта: обязательные поля, запрет неизвестных полей
-	//    (additionalProperties: false), типы и диапазоны координат и цены
+	// сверяем тело со схемой из контракта: обязательные поля, лишние поля, диапазоны
 	if err := h.tripDataSchema.VisitJSON(generic); err != nil {
 		return nil, schemaErrorDetail(err)
 	}
 
-	// 3. разбор в сгенерированный тип; здесь же проверяется формат UUID
+	// раскладываем в сгенерированную структуру, тут же проверяется формат uuid
 	var body TripData
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
@@ -173,7 +168,7 @@ func (h *TripHandler) decodeTripData(w http.ResponseWriter, r *http.Request) (*T
 		return nil, errors.New("user_id and driver_id must be valid UUIDs")
 	}
 
-	// 4. то, чего нет в схеме: UUID должны быть непустыми
+	// нулевой uuid тоже не пропускаем
 	if body.UserId == uuid.Nil {
 		return nil, errors.New("user_id must be a non-empty UUID")
 	}
@@ -184,8 +179,7 @@ func (h *TripHandler) decodeTripData(w http.ResponseWriter, r *http.Request) (*T
 	return &body, nil
 }
 
-// schemaErrorDetail превращает ошибку валидации схемы в короткое сообщение
-// вида "/start_point/latitude: number must be at most 90".
+// вытаскивает из ошибки валидации схемы короткое описание поля и причины
 func schemaErrorDetail(err error) error {
 	var schemaErr *openapi3.SchemaError
 	if errors.As(err, &schemaErr) {
@@ -204,18 +198,15 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// tripResponse — сгенерированный Trip, у которого nullable-поля всегда
-// присутствуют в ответе. В сгенерированном типе у finished_at и
-// last_position_at стоит omitempty, и вместо "finished_at": null поле просто
-// пропадает из JSON. Внешние поля перекрывают одноимённые поля встроенного Trip.
+// обёртка над сгенерированным Trip, чтобы finished_at и last_position_at всегда
+// попадали в json как null, а не пропадали из-за omitempty в сгенерированном типе
 type tripResponse struct {
 	Trip
 	FinishedAt     *time.Time `json:"finished_at"`
 	LastPositionAt *time.Time `json:"last_position_at"`
 }
 
-// mapTripToDTO преобразует внутреннюю модель в структуру контракта OpenAPI.
-// Время всегда отдаётся в UTC.
+// собирает ответ по контракту openapi, время отдаём в utc
 func mapTripToDTO(t *model.Trip) tripResponse {
 	var finishedAt *time.Time
 	if t.FinishedAt != nil {
@@ -237,14 +228,15 @@ func mapTripToDTO(t *model.Trip) tripResponse {
 			Latitude:  t.EndLat,
 			Longitude: t.EndLng,
 		},
-		StartedAt:  t.StartedAt.UTC(),
-		FinishedAt: finishedAt,
+		StartedAt:      t.StartedAt.UTC(),
+		FinishedAt:     finishedAt,
+		LastPositionAt: nil,
 	}
 
 	return tripResponse{
 		Trip:       trip,
 		FinishedAt: finishedAt,
-		// last_position_at заполняется начиная с лабораторной 3
+		// координатами начнём заниматься с третьей лабы, пока тут всегда null
 		LastPositionAt: nil,
 	}
 }

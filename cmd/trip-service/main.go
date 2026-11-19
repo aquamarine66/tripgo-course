@@ -22,13 +22,17 @@ import (
 )
 
 func main() {
-	// подтягиваем локальный .env (если есть)
+	os.Exit(run())
+}
+
+func run() int {
+	// подгружаем локальный .env, если он лежит рядом
 	_ = godotenv.Load()
 
 	cfg, err := config.Load()
 	if err != nil {
 		slog.Error("failed to load configuration", "error", err)
-		os.Exit(1)
+		return 1
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -41,61 +45,65 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// настройка пула подключений к PostgreSQL
+	// настраиваем пул подключений и ограничиваем время коннекта к базе
 	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
 		slog.Error("invalid database url", "error", err)
-		os.Exit(1)
+		return 1
 	}
 
 	poolCfg.MaxConns = cfg.DBMaxConns
 	poolCfg.MinConns = cfg.DBMinConns
 	poolCfg.MaxConnLifetime = cfg.DBMaxConnLifetime
 	poolCfg.ConnConfig.ConnectTimeout = cfg.DBConnectTimeout
+	poolCfg.PingTimeout = cfg.DBConnectTimeout
 
-	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	// один общий контекст с таймаутом на поднятие пула и стартовый ping, чтобы сервис не зависал при недоступной базе
+	connectCtx, connectCancel := context.WithTimeout(ctx, cfg.DBConnectTimeout)
+	defer connectCancel()
+
+	pool, err := pgxpool.NewWithConfig(connectCtx, poolCfg)
 	if err != nil {
 		slog.Error("failed to create db pool", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	defer pool.Close()
 
-	pingCtx, pingCancel := context.WithTimeout(ctx, cfg.DBConnectTimeout)
-	defer pingCancel()
-	if err := pool.Ping(pingCtx); err != nil {
+	if err := pool.Ping(connectCtx); err != nil {
 		slog.Error("failed to ping database", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	slog.Info("connected to postgresql pool")
 
-	// сборка слоёв Clean Architecture
-	txManager := repository.NewTxManager(pool)
+	// собираем зависимости
+	txManager := repository.NewTxManager(pool, cfg.DBQueryTimeout)
 	tripRepo := repository.NewTripRepository(pool, cfg.DBQueryTimeout)
 	tripService := service.NewTripService(tripRepo, txManager)
 	tripHandler, err := api.NewTripHandler(tripService, pool, cfg.DBQueryTimeout)
 	if err != nil {
 		slog.Error("failed to create http handler", "error", err)
-		os.Exit(1)
+		return 1
 	}
 
-	// роутер chi и middleware
+	// настраиваем роутер и мидлвари, паники и неизвестные пути тоже отдаём в problem+json
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Logger)
-	r.Use(middleware.Recoverer)
+	r.Use(api.RecoverMiddleware)
 	r.Use(middleware.Timeout(cfg.DBQueryTimeout + 2*time.Second))
+	r.NotFound(api.NotFoundHandler)
+	r.MethodNotAllowed(api.MethodNotAllowedHandler)
 
-	// регистрация сгенерированного роутинга; ошибки разбора параметров
-	// (например, tripId не UUID) отдаются в формате problem+json
-	api.HandlerWithOptions(tripHandler, api.ChiServerOptions{
+	// вешаем сгенерированные роуты с общим обработчиком ошибок параметров
+	handler := api.HandlerWithOptions(tripHandler, api.ChiServerOptions{
 		BaseRouter:       r,
 		ErrorHandlerFunc: api.ParamErrorHandler,
 	})
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           r,
+		Handler:           handler,
 		ReadTimeout:       cfg.HTTPReadTimeout,
 		ReadHeaderTimeout: cfg.HTTPReadHeaderTimeout,
 		WriteTimeout:      cfg.HTTPWriteTimeout,
@@ -108,12 +116,12 @@ func main() {
 		serverErrors <- server.ListenAndServe()
 	}()
 
-	// ожидание сигнала завершения или критической ошибки сервера
+	// ждём либо падения сервера, либо сигнала на остановку
 	select {
 	case err := <-serverErrors:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("http server failed", "error", err)
-			os.Exit(1)
+			return 1
 		}
 	case <-ctx.Done():
 		slog.Info("shutdown signal caught, terminating gracefully...")
@@ -127,6 +135,8 @@ func main() {
 		}
 		slog.Info("service exited cleanly")
 	}
+
+	return 0
 }
 
 func parseLogLevel(level string) slog.Level {

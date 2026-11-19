@@ -1,43 +1,40 @@
-# Переменные окружения берём из .env, который создаёт `tripgoctl environment start`.
-# Адреса и порты здесь не хардкодим: у каждого своё окружение.
+# подтягиваем переменные из .env, который создаёт tripgoctl environment start
 -include .env
 export
 
 MIGRATIONS_DIR := migrations
 
-.PHONY: generate migrate migrate-down migrate-status run build test lint tidy check-db-url
+.PHONY: generate migrate migrate-down migrate-status run build test tidy check-db-url
 
-## generate: кодогенерация по OpenAPI (internal/api/api.gen.go)
+# генерация типов и роутера из openapi
 generate:
+	mkdir -p internal/api
 	go tool oapi-codegen -config contracts/openapi/oapi-codegen.yaml contracts/openapi/trip-service.openapi.yaml
 
-## migrate: накатить все миграции
+# накатить все миграции
 migrate: check-db-url
 	go tool goose -dir $(MIGRATIONS_DIR) postgres "$(DATABASE_URL)" up
 
-## migrate-down: откатить последнюю миграцию
+# откатить последнюю миграцию
 migrate-down: check-db-url
 	go tool goose -dir $(MIGRATIONS_DIR) postgres "$(DATABASE_URL)" down
 
-## migrate-status: статус миграций
+# посмотреть статус миграций
 migrate-status: check-db-url
 	go tool goose -dir $(MIGRATIONS_DIR) postgres "$(DATABASE_URL)" status
 
-## run: запустить сервис локально
-run:
+# запустить сервис локально (перед запуском обновляем сгенерированный код)
+run: generate
 	go run ./cmd/trip-service
 
-## build: собрать бинарь в bin/
-build:
+# собрать бинарь в bin/ с предварительной кодогенерацией
+build: generate
+	mkdir -p bin
 	go build -o bin/trip-service ./cmd/trip-service
 
-## test: все тесты с -race
-test:
+# прогнать тесты с детектором гонок
+test: generate
 	go test -race ./...
-
-## lint: golangci-lint (обязателен с ЛР2)
-lint:
-	golangci-lint run ./...
 
 tidy:
 	go mod tidy

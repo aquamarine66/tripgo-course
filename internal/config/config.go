@@ -15,13 +15,13 @@ type Config struct {
 	LogLevel        string
 	ShutdownTimeout time.Duration
 
-	// таймауты HTTP-сервера
+	// таймауты http-сервера
 	HTTPReadTimeout       time.Duration
 	HTTPReadHeaderTimeout time.Duration
 	HTTPWriteTimeout      time.Duration
 	HTTPIdleTimeout       time.Duration
 
-	// настройки пула соединений БД
+	// параметры пула подключений к базе
 	DBMaxConns        int32
 	DBMinConns        int32
 	DBConnectTimeout  time.Duration
@@ -29,9 +29,7 @@ type Config struct {
 	DBMaxConnLifetime time.Duration
 }
 
-// Load читает конфигурацию из окружения. Обязательные переменные должны быть
-// заданы, а заданные значения — корректны: при опечатке в значении сервис
-// не стартует молча со значением по умолчанию, а падает с понятной ошибкой.
+// читает конфиг из переменных окружения и возвращает ошибку, если что-то задано криво
 func Load() (*Config, error) {
 	p := &parser{}
 
@@ -71,7 +69,7 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
-// parser копит ошибки, чтобы сообщить обо всех неверных переменных сразу.
+// собирает ошибки парсинга env, чтобы показать сразу все проблемы на старте
 type parser struct {
 	errs []error
 }
@@ -115,8 +113,7 @@ func (p *parser) int32(key string, def int32) int32 {
 	return int32(n)
 }
 
-// duration разбирает положительную длительность: нулевой или отрицательный
-// таймаут означал бы «без таймаута» либо мгновенную ошибку.
+// парсит положительный таймаут, нулевой или отрицательный не принимаем
 func (p *parser) duration(key string, def time.Duration) time.Duration {
 	v := os.Getenv(key)
 	if v == "" {

@@ -18,8 +18,7 @@ const (
 	StatusCompleted = "completed"
 )
 
-// Trip — поездка. Поля соответствуют таблице trips из contracts/schema.md.
-// колонка last_position_at появится в работе 3, поэтому здесь её пока нет.
+// модель поездки по схеме таблицы trips (last_position_at добавится в третьей лабе)
 type Trip struct {
 	ID         uuid.UUID
 	UserID     uuid.UUID
@@ -36,8 +35,7 @@ type Trip struct {
 	UpdatedAt  time.Time
 }
 
-// StatusChange — запись журнала trip_status_history.
-// FromStatus пуст (nil) при создании поездки: прежнего статуса нет.
+// запись истории статусов, при создании поездки from_status остаётся пустым
 type StatusChange struct {
 	TripID     uuid.UUID
 	FromStatus *string

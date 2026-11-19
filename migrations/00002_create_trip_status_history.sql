@@ -1,6 +1,5 @@
 -- +goose Up
--- Журнал переходов статуса поездки — строго по contracts/schema.md.
--- from_status пуст при создании поездки: прежнего статуса нет.
+-- журнал переходов статуса поездки, при создании from_status пустой
 CREATE TABLE trip_status_history (
     id          BIGSERIAL PRIMARY KEY,
     trip_id     UUID NOT NULL REFERENCES trips(id) ON DELETE CASCADE,

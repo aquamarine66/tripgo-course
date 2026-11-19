@@ -16,14 +16,13 @@ import (
 	"github.com/aquamarine66/tripgo-course/internal/model"
 )
 
-// pgUniqueViolation — код ошибки PostgreSQL unique_violation.
+// код ошибки postgres при нарушении уникального ограничения
 const pgUniqueViolation = "23505"
 
-// driverActiveTripIndex — частичный уникальный индекс из миграции 00001,
-// запрещающий водителю иметь больше одной активной поездки.
+// имя частичного уникального индекса на активную поездку водителя
 const driverActiveTripIndex = "trips_driver_active_uniq"
 
-// psql — билдер squirrel с плейсхолдерами $N для PostgreSQL.
+// билдер sql с плейсхолдерами $1, $2 для postgres
 var psql = sq.StatementBuilder.PlaceholderFormat(sq.Dollar)
 
 var tripColumns = []string{
@@ -37,8 +36,7 @@ type TripRepository struct {
 	queryTimeout time.Duration
 }
 
-// NewTripRepository создаёт репозиторий. queryTimeout ограничивает время
-// выполнения каждого запроса к бд (DATABASE_QUERY_TIMEOUT).
+// создаёт репозиторий с таймаутом на выполнение каждого запроса
 func NewTripRepository(pool *pgxpool.Pool, queryTimeout time.Duration) *TripRepository {
 	return &TripRepository{pool: pool, queryTimeout: queryTimeout}
 }
@@ -67,7 +65,7 @@ func (r *TripRepository) CreateTrip(ctx context.Context, trip *model.Trip) error
 	err = getQuerier(ctx, r.pool).QueryRow(ctx, query, args...).Scan(&trip.CreatedAt, &trip.UpdatedAt)
 	if err != nil {
 		var pgErr *pgconn.PgError
-		// 23505 на частичном индексе — у водителя уже есть активная поездка
+		// ловим конфликт по частичному индексу, если у водителя уже идёт поездка
 		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation && pgErr.ConstraintName == driverActiveTripIndex {
 			return model.ErrDriverAlreadyHasActiveTrip
 		}
@@ -119,10 +117,7 @@ func (r *TripRepository) GetTripByID(ctx context.Context, id uuid.UUID) (*model.
 	return t, nil
 }
 
-// FinishTrip атомарно переводит поездку active → completed. Статус проверяется
-// условием прямо в UPDATE, поэтому между проверкой и записью нет окна для
-// параллельного запроса: из двух одновременных вызовов строку обновит только
-// один, второй получит 0 затронутых строк.
+// атомарно завершает активную поездку через условие в where, чтобы защититься от двойного finish
 func (r *TripRepository) FinishTrip(ctx context.Context, id uuid.UUID, finishedAt time.Time) (*model.Trip, error) {
 	ctx, cancel := context.WithTimeout(ctx, r.queryTimeout)
 	defer cancel()
@@ -148,7 +143,7 @@ func (r *TripRepository) FinishTrip(ctx context.Context, id uuid.UUID, finishedA
 		return nil, fmt.Errorf("finish trip: %w", err)
 	}
 
-	// ни одна строка не обновилась: различаем «поездки нет» и «уже завершена»
+	// ничего не обновилось, проверяем, поездки вообще нет или она уже завершена
 	checkQuery, checkArgs, err := psql.Select("status").
 		From("trips").
 		Where(sq.Eq{"id": id}).

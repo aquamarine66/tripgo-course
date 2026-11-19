@@ -14,9 +14,7 @@ import (
 	"github.com/aquamarine66/tripgo-course/internal/model"
 )
 
-// интеграционные тесты менеджера транзакций. Нужна бд с накатанными
-// миграциями: TEST_DATABASE_URL=$DATABASE_URL go test ./internal/repository/
-// без TEST_DATABASE_URL тесты пропускаются.
+// интеграционные тесты менеджера транзакций, без TEST_DATABASE_URL они просто пропускаются
 func newTestDeps(t *testing.T) (*pgxpool.Pool, *TxManager, *TripRepository) {
 	t.Helper()
 
@@ -34,7 +32,7 @@ func newTestDeps(t *testing.T) (*pgxpool.Pool, *TxManager, *TripRepository) {
 	}
 	t.Cleanup(pool.Close)
 
-	return pool, NewTxManager(pool), NewTripRepository(pool, 3*time.Second)
+	return pool, NewTxManager(pool, 3*time.Second), NewTripRepository(pool, 3*time.Second)
 }
 
 func newTrip() *model.Trip {
@@ -68,7 +66,8 @@ func TestDo_RollbackOnError(t *testing.T) {
 		if err := repo.CreateTrip(ctx, trip); err != nil {
 			return err
 		}
-		return errBoom // «падение второй вставки»
+		// имитируем ошибку на втором шаге
+		return errBoom
 	})
 	if !errors.Is(err, errBoom) {
 		t.Fatalf("expected errBoom, got %v", err)
@@ -114,7 +113,7 @@ func TestDo_NestedReusesTransaction(t *testing.T) {
 			return err
 		}
 
-		// вложенный Do ничего не закоммитил: откат внешнего откатывает и его
+		// вложенный вызов ничего не коммитил, поэтому ошибка во внешнем должна всё откатить
 		return errBoom
 	})
 	if !errors.Is(err, errBoom) {
@@ -131,7 +130,7 @@ func TestCreateTrip_AtomicWithHistory(t *testing.T) {
 		if err := repo.CreateTrip(ctx, trip); err != nil {
 			return err
 		}
-		// to_status нарушает CHECK — вторая вставка падает в бд
+		// передаём невалидный статус, чтобы вставка в историю упала по check-ограничению
 		return repo.AddStatusHistory(ctx, model.StatusChange{
 			TripID:    trip.ID,
 			ToStatus:  "broken",

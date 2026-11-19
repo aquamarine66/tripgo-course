@@ -10,14 +10,12 @@ import (
 	"github.com/aquamarine66/tripgo-course/internal/model"
 )
 
-// TxManager — то, что сервису нужно от менеджера транзакций.
-// Про pgx, пулы и сами транзакции сервис ничего не знает.
+// интерфейс менеджера транзакций, чтобы сервис не зависел от pgx
 type TxManager interface {
 	Do(ctx context.Context, fn func(ctx context.Context) error) error
 }
 
-// TripRepository — хранилище поездок. Транзакция аргументом не передаётся:
-// репозиторий сам достаёт её из контекста.
+// интерфейс репозитория, саму транзакцию он достаёт из контекста
 type TripRepository interface {
 	CreateTrip(ctx context.Context, trip *model.Trip) error
 	AddStatusHistory(ctx context.Context, change model.StatusChange) error
@@ -25,7 +23,7 @@ type TripRepository interface {
 	FinishTrip(ctx context.Context, id uuid.UUID, finishedAt time.Time) (*model.Trip, error)
 }
 
-// CreateTripInput — уже провалидированные данные для создания поездки.
+// входные данные для создания поездки после валидации в хендлере
 type CreateTripInput struct {
 	UserID   uuid.UUID
 	DriverID uuid.UUID
@@ -48,7 +46,7 @@ func NewTripService(repo TripRepository, txManager TxManager) *TripService {
 	}
 }
 
-// CreateTrip атомарно пишет поездку в trips и запись в trip_status_history.
+// создаёт поездку и сразу пишет первую запись в историю в одной транзакции
 func (s *TripService) CreateTrip(ctx context.Context, in CreateTripInput) (*model.Trip, error) {
 	now := currentTime()
 	trip := &model.Trip{
@@ -90,7 +88,7 @@ func (s *TripService) GetTrip(ctx context.Context, id uuid.UUID) (*model.Trip, e
 	return trip, nil
 }
 
-// FinishTrip завершает поездку и пишет переход в журнал в одной транзакции.
+// завершает поездку и фиксирует переход статуса в журнале в одной транзакции
 func (s *TripService) FinishTrip(ctx context.Context, id uuid.UUID) (*model.Trip, error) {
 	now := currentTime()
 
@@ -118,9 +116,7 @@ func (s *TripService) FinishTrip(ctx context.Context, id uuid.UUID) (*model.Trip
 	return trip, nil
 }
 
-// currentTime возвращает текущее время в UTC с точностью до микросекунд —
-// такой же, как у TIMESTAMPTZ в PostgreSQL. Иначе ответ на создание
-// (наносекунды) отличался бы от того, что потом отдаёт GET (микросекунды).
+// обрезаем время до микросекунд, чтобы оно совпадало с тем, как postgres хранит timestamptz
 func currentTime() time.Time {
 	return time.Now().UTC().Truncate(time.Microsecond)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -12,49 +13,51 @@ import (
 
 type txKey struct{}
 
-// PgxQuerier объединяет методы *pgxpool.Pool и pgx.Tx
+// общий интерфейс для *pgxpool.Pool и pgx.Tx
 type PgxQuerier interface {
 	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-// TxManager управляет транзакциями так, что бизнес-код ничего не знает о pgx:
-// транзакция живёт в context и достаётся репозиториями через getQuerier.
+// менеджер транзакций прячет pgx от сервиса и передаёт текущую транзакцию через контекст
 type TxManager struct {
 	pool     *pgxpool.Pool
 	isoLevel pgx.TxIsoLevel
+	timeout  time.Duration
 }
 
-// NewTxManager создаёт менеджер транзакций с уровнем изоляции READ COMMITTED.
-func NewTxManager(pool *pgxpool.Pool) *TxManager {
+// создаёт менеджер транзакций с уровнем изоляции read committed и таймаутом на служебные операции
+func NewTxManager(pool *pgxpool.Pool, timeout time.Duration) *TxManager {
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
 	return &TxManager{
 		pool:     pool,
 		isoLevel: pgx.ReadCommitted,
+		timeout:  timeout,
 	}
 }
 
-// Do запускает fn внутри транзакции.
-//
-//   - fn вернула nil → COMMIT;
-//   - fn вернула ошибку → ROLLBACK, ошибка пробрасывается наружу;
-//   - fn запаниковала → ROLLBACK, паника пробрасывается дальше;
-//   - если в ctx уже есть транзакция (вложенный Do), fn выполняется в ней же,
-//     новая транзакция не открывается, а commit/rollback делает внешний Do.
-func (m *TxManager) Do(ctx context.Context, fn func(ctx context.Context) error) (err error) {
+// запускает fn внутри транзакции: при ошибке или панике откатывает изменения,
+// а если транзакция уже есть в контексте, просто переиспользует её
+func (m *TxManager) Do(ctx context.Context, fn func(ctx context.Context) error) error {
 	if _, ok := ctx.Value(txKey{}).(pgx.Tx); ok {
 		return fn(ctx)
 	}
 
-	tx, err := m.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: m.isoLevel})
+	beginCtx, beginCancel := context.WithTimeout(ctx, m.timeout)
+	tx, err := m.pool.BeginTx(beginCtx, pgx.TxOptions{IsoLevel: m.isoLevel})
+	beginCancel()
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
 
-	// откат выполняем с контекстом без отмены: если контекст запроса уже
-	// отменён (таймаут, клиент ушёл), ROLLBACK всё равно должен дойти до бд
+	// откат запускаем на отдельном контексте с таймаутом, чтобы он успел дойти до базы даже после отмены запроса
 	rollback := func() error {
-		return tx.Rollback(context.WithoutCancel(ctx))
+		rbCtx, rbCancel := context.WithTimeout(context.WithoutCancel(ctx), m.timeout)
+		defer rbCancel()
+		return tx.Rollback(rbCtx)
 	}
 
 	defer func() {
@@ -71,14 +74,16 @@ func (m *TxManager) Do(ctx context.Context, fn func(ctx context.Context) error) 
 		return err
 	}
 
-	if err := tx.Commit(ctx); err != nil {
+	commitCtx, commitCancel := context.WithTimeout(ctx, m.timeout)
+	defer commitCancel()
+	if err := tx.Commit(commitCtx); err != nil {
 		return fmt.Errorf("commit transaction: %w", err)
 	}
 
 	return nil
 }
 
-// getQuerier возвращает pgx.Tx если контекст находится внутри транзакции,а иначе отдаёт сам пул
+// достаёт транзакцию из контекста, а если её там нет, возвращает обычный пул
 func getQuerier(ctx context.Context, pool *pgxpool.Pool) PgxQuerier {
 	if tx, ok := ctx.Value(txKey{}).(pgx.Tx); ok {
 		return tx
