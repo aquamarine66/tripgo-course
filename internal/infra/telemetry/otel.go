@@ -6,9 +6,10 @@ import (
 	"fmt"
 	"time"
 
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
@@ -18,26 +19,36 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-const instrumentationScope = "github.com/aquamarine66/tripgo-course"
+const (
+	instrumentationScope = "github.com/aquamarine66/tripgo-course"
+	protocolHTTPProtobuf = "http/protobuf"
+	protocolGRPC         = "grpc"
+	exportTimeout        = 2 * time.Second
+)
 
-// Config — настройки инициализации OpenTelemetry SDK.
+// настройки инициализации opentelemetry sdk
 type Config struct {
 	ServiceName      string
 	ServiceVersion   string
 	ServiceNamespace string
 	Environment      string
 	OTLPEndpoint     string
+	OTLPProtocol     string
 	TracesSampler    string
+	TracesSamplerArg float64
 }
 
-// Providers содержит провайдеры трейсов и метрик и метод их корректного завершения.
+// собранные провайдеры, пропагатор и закрывалка для передачи через di без глобального состояния
 type Providers struct {
-	Tracer   trace.Tracer
-	Meter    metric.Meter
-	shutdown func(ctx context.Context) error
+	TracerProvider trace.TracerProvider
+	MeterProvider  metric.MeterProvider
+	Propagator     propagation.TextMapPropagator
+	Tracer         trace.Tracer
+	Meter          metric.Meter
+	shutdown       func(ctx context.Context) error
 }
 
-// Shutdown сбрасывает накопленные батчи трейсов и метрик и закрывает экспортеры.
+// сбрасываем буферы трейсов и метрик и закрываем экспортеры
 func (p *Providers) Shutdown(ctx context.Context) error {
 	if p == nil || p.shutdown == nil {
 		return nil
@@ -45,10 +56,21 @@ func (p *Providers) Shutdown(ctx context.Context) error {
 	return p.shutdown(ctx)
 }
 
-// Setup инициализирует TracerProvider, MeterProvider и W3C TraceContext propagator.
-// Если OTLPEndpoint не задан, провайдеры работают без сетевого экспортера
-// (спаны создаются и дают валидные trace_id/span_id для логов, а сервис не падает).
+// поднимаем провайдеры трейсов, метрик и w3c-пропагатор; если endpoint пустой, работаем локально без сети
 func Setup(ctx context.Context, cfg Config) (*Providers, error) {
+	protocol := cfg.OTLPProtocol
+	if protocol == "" {
+		protocol = protocolHTTPProtobuf
+	}
+	if protocol != protocolHTTPProtobuf && protocol != protocolGRPC {
+		return nil, fmt.Errorf("unsupported otlp protocol: %q", protocol)
+	}
+
+	sampler, err := selectSampler(cfg.TracesSampler, cfg.TracesSamplerArg)
+	if err != nil {
+		return nil, err
+	}
+
 	res, err := resource.New(ctx,
 		resource.WithFromEnv(),
 		resource.WithTelemetrySDK(),
@@ -74,23 +96,18 @@ func Setup(ctx context.Context, cfg Config) (*Providers, error) {
 
 	tpOpts := []sdktrace.TracerProviderOption{
 		sdktrace.WithResource(res),
-		sdktrace.WithSampler(selectSampler(cfg.TracesSampler)),
+		sdktrace.WithSampler(sampler),
 	}
 	mpOpts := []sdkmetric.Option{
 		sdkmetric.WithResource(res),
 	}
 
 	if cfg.OTLPEndpoint != "" {
-		traceExp, err := otlptracehttp.New(ctx, otlptracehttp.WithTimeout(2*time.Second))
+		traceExp, metricExp, err := buildExporters(ctx, protocol)
 		if err != nil {
-			return nil, fmt.Errorf("create otlp trace exporter: %w", err)
+			return nil, err
 		}
 		tpOpts = append(tpOpts, sdktrace.WithBatcher(traceExp, sdktrace.WithBatchTimeout(time.Second)))
-
-		metricExp, err := otlpmetrichttp.New(ctx, otlpmetrichttp.WithTimeout(2*time.Second))
-		if err != nil {
-			return nil, fmt.Errorf("create otlp metric exporter: %w", err)
-		}
 		mpOpts = append(mpOpts, sdkmetric.WithReader(
 			sdkmetric.NewPeriodicReader(metricExp, sdkmetric.WithInterval(5*time.Second)),
 		))
@@ -102,27 +119,67 @@ func Setup(ctx context.Context, cfg Config) (*Providers, error) {
 	mp := sdkmetric.NewMeterProvider(mpOpts...)
 	closers = append(closers, mp.Shutdown)
 
-	otel.SetTracerProvider(tp)
-	otel.SetMeterProvider(mp)
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+	propagator := propagation.NewCompositeTextMapPropagator(
 		propagation.TraceContext{},
 		propagation.Baggage{},
-	))
+	)
 
 	return &Providers{
-		Tracer:   tp.Tracer(instrumentationScope),
-		Meter:    mp.Meter(instrumentationScope),
-		shutdown: shutdownAll,
+		TracerProvider: tp,
+		MeterProvider:  mp,
+		Propagator:     propagator,
+		Tracer:         tp.Tracer(instrumentationScope),
+		Meter:          mp.Meter(instrumentationScope),
+		shutdown:       shutdownAll,
 	}, nil
 }
 
-func selectSampler(name string) sdktrace.Sampler {
-	switch name {
-	case "always_off":
-		return sdktrace.NeverSample()
-	case "always_on":
-		return sdktrace.AlwaysSample()
+func buildExporters(ctx context.Context, protocol string) (sdktrace.SpanExporter, sdkmetric.Exporter, error) {
+	switch protocol {
+	case protocolHTTPProtobuf:
+		traceExp, err := otlptracehttp.New(ctx, otlptracehttp.WithTimeout(exportTimeout))
+		if err != nil {
+			return nil, nil, fmt.Errorf("create otlp http trace exporter: %w", err)
+		}
+		metricExp, err := otlpmetrichttp.New(ctx, otlpmetrichttp.WithTimeout(exportTimeout))
+		if err != nil {
+			_ = traceExp.Shutdown(ctx)
+			return nil, nil, fmt.Errorf("create otlp http metric exporter: %w", err)
+		}
+		return traceExp, metricExp, nil
+
+	case protocolGRPC:
+		traceExp, err := otlptracegrpc.New(ctx, otlptracegrpc.WithTimeout(exportTimeout))
+		if err != nil {
+			return nil, nil, fmt.Errorf("create otlp grpc trace exporter: %w", err)
+		}
+		metricExp, err := otlpmetricgrpc.New(ctx, otlpmetricgrpc.WithTimeout(exportTimeout))
+		if err != nil {
+			_ = traceExp.Shutdown(ctx)
+			return nil, nil, fmt.Errorf("create otlp grpc metric exporter: %w", err)
+		}
+		return traceExp, metricExp, nil
+
 	default:
-		return sdktrace.ParentBased(sdktrace.AlwaysSample())
+		return nil, nil, fmt.Errorf("unsupported otlp protocol: %q", protocol)
+	}
+}
+
+func selectSampler(name string, arg float64) (sdktrace.Sampler, error) {
+	switch name {
+	case "", "parentbased_always_on":
+		return sdktrace.ParentBased(sdktrace.AlwaysSample()), nil
+	case "parentbased_always_off":
+		return sdktrace.ParentBased(sdktrace.NeverSample()), nil
+	case "parentbased_traceidratio":
+		return sdktrace.ParentBased(sdktrace.TraceIDRatioBased(arg)), nil
+	case "always_on":
+		return sdktrace.AlwaysSample(), nil
+	case "always_off":
+		return sdktrace.NeverSample(), nil
+	case "traceidratio":
+		return sdktrace.TraceIDRatioBased(arg), nil
+	default:
+		return nil, fmt.Errorf("unsupported traces sampler: %q", name)
 	}
 }

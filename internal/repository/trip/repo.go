@@ -21,7 +21,7 @@ var psql = sq.StatementBuilder.PlaceholderFormat(sq.Dollar)
 var tripColumns = []string{
 	"id", "user_id", "driver_id", "status", "price",
 	"start_latitude", "start_longitude", "end_latitude", "end_longitude",
-	"started_at", "finished_at", "created_at", "updated_at",
+	"started_at", "finished_at", "last_position_at", "created_at", "updated_at",
 }
 
 // Repository — PostgreSQL-репозиторий поездок и журнала переходов статуса.

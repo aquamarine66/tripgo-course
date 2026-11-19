@@ -8,15 +8,23 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/aquamarine66/tripgo-course/internal/http/domainerror"
 )
+
+const unknownRoute = "unknown"
+
+// обёртка показывает внешнему Recover, что панику уже залогировали внутри Tracing с trace_id
+type loggedPanic struct {
+	value any
+}
 
 type statusRecorder struct {
 	http.ResponseWriter
@@ -46,24 +54,26 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 	return r.ResponseWriter.Write(b)
 }
 
-// Recover ловит панику в цепочке обработчиков, логирует её со стектрейсом и
-// отвечает 500 internal_error в формате application/problem+json.
+// перехватываем панику на самом внешнем слое и отдаём клиенту 500 в формате problem+json
 func Recover(logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			rec := wrapResponseWriter(w)
 			defer func() {
 				if p := recover(); p != nil {
-					if logger != nil {
+					val := p
+					if lp, ok := p.(loggedPanic); ok {
+						val = lp.value
+					} else if logger != nil {
 						logger.ErrorContext(r.Context(), "panic recovered",
-							"panic", fmt.Sprint(p),
+							"panic", fmt.Sprint(val),
 							"method", r.Method,
 							"path", r.URL.Path,
 							"stack", string(debug.Stack()),
 						)
 					}
 					if !rec.wrote {
-						domainerror.Write(rec, r, nil, fmt.Errorf("panic: %v", p))
+						domainerror.Write(rec, r, nil, fmt.Errorf("panic: %v", val))
 					}
 				}
 			}()
@@ -72,37 +82,67 @@ func Recover(logger *slog.Logger) func(http.Handler) http.Handler {
 	}
 }
 
-// Tracing извлекает W3C TraceContext из заголовков, создаёт корневой спан
-// входящего HTTP-запроса и переименовывает его в "{method} {http.route}" после роутинга chi.
-func Tracing(tracer trace.Tracer) func(http.Handler) http.Handler {
+// инструментируем входящие http-запросы через otelhttp, переименовываем спан по шаблону маршрута
+// и фиксируем панику в спане и логе до его закрытия, после чего пробрасываем её во внешний Recover
+func Tracing(
+	tp trace.TracerProvider,
+	prop propagation.TextMapPropagator,
+	logger *slog.Logger,
+) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
-			ctx, span := tracer.Start(ctx, r.Method,
-				trace.WithSpanKind(trace.SpanKindServer),
-				trace.WithAttributes(attribute.String("http.request.method", r.Method)),
-			)
-			defer span.End()
-
+		inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			rec := wrapResponseWriter(w)
-			next.ServeHTTP(rec, r.WithContext(ctx))
+			defer func() {
+				route := routePattern(r)
+				span := trace.SpanFromContext(r.Context())
+				if span.IsRecording() {
+					span.SetName(r.Method + " " + route)
+					span.SetAttributes(attribute.String("http.route", route))
+				}
 
-			route := routePattern(r)
-			span.SetName(r.Method + " " + route)
-			span.SetAttributes(
-				attribute.String("http.route", route),
-				attribute.Int("http.response.status_code", rec.status),
-			)
-			if rec.status >= http.StatusInternalServerError {
-				span.SetStatus(codes.Error, http.StatusText(rec.status))
-				span.SetAttributes(attribute.String("error.type", fmt.Sprintf("%d", rec.status)))
-			}
+				if p := recover(); p != nil {
+					if span.IsRecording() {
+						span.RecordError(fmt.Errorf("panic: %v", p))
+						span.SetStatus(codes.Error, "panic")
+						span.SetAttributes(
+							attribute.Int("http.response.status_code", http.StatusInternalServerError),
+							attribute.String("error.type", "panic"),
+						)
+					}
+					if logger != nil {
+						logger.ErrorContext(r.Context(), "panic recovered",
+							"panic", fmt.Sprint(p),
+							"method", r.Method,
+							"route", route,
+							"path", r.URL.Path,
+							"stack", string(debug.Stack()),
+						)
+					}
+					panic(loggedPanic{value: p})
+				}
+			}()
+			next.ServeHTTP(rec, r)
 		})
+
+		// метрики http пишет наш middleware.Metrics с точным шаблоном http.route, чтобы не было дублей
+		opts := []otelhttp.Option{
+			otelhttp.WithMeterProvider(noop.NewMeterProvider()),
+			otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+				return r.Method + " " + routePattern(r)
+			}),
+		}
+		if tp != nil {
+			opts = append(opts, otelhttp.WithTracerProvider(tp))
+		}
+		if prop != nil {
+			opts = append(opts, otelhttp.WithPropagators(prop))
+		}
+
+		return otelhttp.NewHandler(inner, "", opts...)
 	}
 }
 
-// Logging пишет ровно одну JSON-запись на каждый HTTP-запрос после завершения ответа.
-// Для 2xx и 4xx используется уровень Info, для 5xx — Error.
+// пишем одну итоговую json-запись на каждый запрос: info для 2xx/4xx, error для 5xx
 func Logging(logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -133,8 +173,7 @@ func Logging(logger *slog.Logger) func(http.Handler) http.Handler {
 	}
 }
 
-// Metrics записывает метрики http.server.active_requests и http.server.request.duration
-// с шаблоном маршрута в атрибуте http.route (без подстановки tripId).
+// записываем длительность запросов и счётчик активных запросов с шаблоном маршрута в http.route
 func Metrics(
 	requestDuration metric.Float64Histogram,
 	activeRequests metric.Int64UpDownCounter,
@@ -184,7 +223,7 @@ func routePattern(r *http.Request) string {
 func matchRoutePattern(r *http.Request) string {
 	rctx := chi.RouteContext(r.Context())
 	if rctx == nil || rctx.Routes == nil {
-		return "unknown"
+		return unknownRoute
 	}
 	tctx := chi.NewRouteContext()
 	if rctx.Routes.Match(tctx, r.Method, r.URL.Path) {
@@ -192,5 +231,5 @@ func matchRoutePattern(r *http.Request) string {
 			return p
 		}
 	}
-	return "unknown"
+	return unknownRoute
 }
