@@ -68,6 +68,8 @@ func NewRouter(cfg RouterConfig) http.Handler {
 	if cfg.RequestDuration != nil || cfg.ActiveRequests != nil {
 		r.Use(middleware.Metrics(cfg.RequestDuration, cfg.ActiveRequests))
 	}
+	r.NotFound(domainerror.NotFoundHandler)
+	r.MethodNotAllowed(domainerror.MethodNotAllowedHandler)
 
 	return api.HandlerWithOptions(srv, api.ChiServerOptions{
 		BaseRouter:       r,

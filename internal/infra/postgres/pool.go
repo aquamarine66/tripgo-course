@@ -74,19 +74,20 @@ func NewPool(ctx context.Context, cfg Config, queryTracer pgx.QueryTracer) (*pgx
 	poolCfg.MinConns = cfg.MinConns
 	poolCfg.MaxConnLifetime = cfg.MaxConnLifetime
 	poolCfg.ConnConfig.ConnectTimeout = cfg.ConnectTimeout
+	poolCfg.PingTimeout = cfg.ConnectTimeout
 	if queryTracer != nil {
 		poolCfg.ConnConfig.Tracer = queryTracer
 	}
 
-	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	connectCtx, cancel := context.WithTimeout(ctx, cfg.ConnectTimeout)
+	defer cancel()
+
+	pool, err := pgxpool.NewWithConfig(connectCtx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("create pgx pool: %w", err)
 	}
 
-	pingCtx, cancel := context.WithTimeout(ctx, cfg.ConnectTimeout)
-	defer cancel()
-
-	if err := pool.Ping(pingCtx); err != nil {
+	if err := pool.Ping(connectCtx); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}

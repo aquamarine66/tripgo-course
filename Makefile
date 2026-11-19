@@ -9,6 +9,7 @@ MIGRATIONS_DIR := migrations
 
 ## generate: кодогенерация по OpenAPI (internal/generated/api.gen.go) и моки gomock
 generate:
+	mkdir -p internal/generated
 	go tool oapi-codegen -config contracts/openapi/oapi-codegen.yaml contracts/openapi/trip-service.openapi.yaml
 	go generate ./internal/...
 
@@ -25,15 +26,16 @@ migrate-status: check-db-url
 	go tool goose -dir $(MIGRATIONS_DIR) postgres "$(DATABASE_URL)" status
 
 ## run: запустить сервис локально
-run:
+run: generate
 	go run ./cmd/trip-service
 
 ## build: собрать бинарь в bin/
-build:
+build: generate
+	mkdir -p bin
 	go build -o bin/trip-service ./cmd/trip-service
 
 ## test: все unit-тесты с -race и выводом итогового покрытия domain и usecase
-test:
+test: generate
 	go test -race -coverprofile=coverage.out ./...
 	@go tool cover -func=coverage.out | grep -E '(internal/domain|internal/usecase|total:)'
 	@rm -f coverage.out

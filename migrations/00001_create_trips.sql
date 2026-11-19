@@ -1,6 +1,5 @@
 -- +goose Up
--- Таблица поездок. Имена и типы колонок — строго по contracts/schema.md.
--- Колонка last_position_at добавляется отдельной миграцией в работе 3.
+-- таблица поездок по схеме из contracts/schema.md (last_position_at добавится в третьей лабе)
 CREATE TABLE trips (
     id              UUID PRIMARY KEY,
     user_id         UUID NOT NULL,
@@ -27,8 +26,7 @@ CREATE TABLE trips (
 
 CREATE INDEX trips_status_started_at_idx ON trips (status, started_at);
 
--- Частичный уникальный индекс: у одного водителя не может быть больше одной
--- активной поездки. Держится и при конкурентных INSERT: второй получит 23505.
+-- частичный уникальный индекс: не даём одному водителю открыть две активные поездки сразу
 CREATE UNIQUE INDEX trips_driver_active_uniq
     ON trips (driver_id)
     WHERE status = 'active';

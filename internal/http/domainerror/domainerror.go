@@ -48,6 +48,18 @@ var (
 		typ:    "https://tripgo.example/problems/not-implemented",
 		title:  "Not implemented",
 	}
+	kindNotFound = problemKind{
+		status: http.StatusNotFound,
+		code:   "not_found",
+		typ:    "https://tripgo.example/problems/not-found",
+		title:  "Not Found",
+	}
+	kindMethodNotAllowed = problemKind{
+		status: http.StatusMethodNotAllowed,
+		code:   "method_not_allowed",
+		typ:    "https://tripgo.example/problems/method-not-allowed",
+		title:  "Method Not Allowed",
+	}
 	kindInternal = problemKind{
 		status: http.StatusInternalServerError,
 		code:   "internal_error",
@@ -97,6 +109,18 @@ func Write(w http.ResponseWriter, r *http.Request, logger *slog.Logger, err erro
 // WriteNotImplemented отдаёт 501 в формате problem+json для заглушек будущих работ.
 func WriteNotImplemented(w http.ResponseWriter, r *http.Request, detail string) {
 	status, body := buildProblem(kindNotImplemented, detail, r.URL.Path)
+	writeBody(w, status, body)
+}
+
+// NotFoundHandler отдаёт 404 в формате problem+json для неизвестных маршрутов.
+func NotFoundHandler(w http.ResponseWriter, r *http.Request) {
+	status, body := buildProblem(kindNotFound, "Route not found", r.URL.Path)
+	writeBody(w, status, body)
+}
+
+// MethodNotAllowedHandler отдаёт 405 в формате problem+json при неподдерживаемом методе.
+func MethodNotAllowedHandler(w http.ResponseWriter, r *http.Request) {
+	status, body := buildProblem(kindMethodNotAllowed, "Method is not allowed", r.URL.Path)
 	writeBody(w, status, body)
 }
 

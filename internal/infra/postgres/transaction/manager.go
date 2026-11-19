@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+const defaultTxOpTimeout = 3 * time.Second
 
 type txKey struct{}
 
@@ -44,13 +47,17 @@ func (m *Manager) Do(ctx context.Context, fn func(ctx context.Context) error) er
 		return fn(ctx)
 	}
 
-	tx, err := m.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: m.isoLevel})
+	beginCtx, beginCancel := context.WithTimeout(ctx, defaultTxOpTimeout)
+	tx, err := m.pool.BeginTx(beginCtx, pgx.TxOptions{IsoLevel: m.isoLevel})
+	beginCancel()
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
 
 	rollback := func() error {
-		return tx.Rollback(context.WithoutCancel(ctx))
+		rbCtx, rbCancel := context.WithTimeout(context.WithoutCancel(ctx), defaultTxOpTimeout)
+		defer rbCancel()
+		return tx.Rollback(rbCtx)
 	}
 
 	defer func() {
@@ -67,7 +74,9 @@ func (m *Manager) Do(ctx context.Context, fn func(ctx context.Context) error) er
 		return err
 	}
 
-	if err := tx.Commit(ctx); err != nil {
+	commitCtx, commitCancel := context.WithTimeout(ctx, defaultTxOpTimeout)
+	defer commitCancel()
+	if err := tx.Commit(commitCtx); err != nil {
 		return fmt.Errorf("commit transaction: %w", err)
 	}
 
