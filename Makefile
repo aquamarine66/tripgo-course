@@ -1,40 +1,52 @@
-# подтягиваем переменные из .env, который создаёт tripgoctl environment start
+# Переменные окружения берём из .env, который создаёт `tripgoctl environment start`.
+# Адреса и порты здесь не хардкодим: у каждого своё окружение.
 -include .env
 export
 
 MIGRATIONS_DIR := migrations
 
-.PHONY: generate migrate migrate-down migrate-status run build test tidy check-db-url
+.PHONY: generate migrate migrate-down migrate-status run build test test-integration lint tidy check-db-url
 
-# генерация типов и роутера из openapi
+## generate: кодогенерация по OpenAPI (internal/generated/api.gen.go) и моки gomock
 generate:
-	mkdir -p internal/api
+	mkdir -p internal/generated
 	go tool oapi-codegen -config contracts/openapi/oapi-codegen.yaml contracts/openapi/trip-service.openapi.yaml
+	go generate ./internal/...
 
-# накатить все миграции
+## migrate: накатить все миграции
 migrate: check-db-url
 	go tool goose -dir $(MIGRATIONS_DIR) postgres "$(DATABASE_URL)" up
 
-# откатить последнюю миграцию
+## migrate-down: откатить последнюю миграцию
 migrate-down: check-db-url
 	go tool goose -dir $(MIGRATIONS_DIR) postgres "$(DATABASE_URL)" down
 
-# посмотреть статус миграций
+## migrate-status: статус миграций
 migrate-status: check-db-url
 	go tool goose -dir $(MIGRATIONS_DIR) postgres "$(DATABASE_URL)" status
 
-# запустить сервис локально (перед запуском обновляем сгенерированный код)
+## run: запустить сервис локально
 run: generate
 	go run ./cmd/trip-service
 
-# собрать бинарь в bin/ с предварительной кодогенерацией
+## build: собрать бинарь в bin/
 build: generate
 	mkdir -p bin
 	go build -o bin/trip-service ./cmd/trip-service
 
-# прогнать тесты с детектором гонок
+## test: все unit-тесты с -race и выводом итогового покрытия domain и usecase
 test: generate
-	go test -race ./...
+	go test -race -coverprofile=coverage.out ./...
+	@go tool cover -func=coverage.out | grep -E '(internal/domain|internal/usecase|total:)'
+	@rm -f coverage.out
+
+## test-integration: интеграционные тесты репозитория на реальном PostgreSQL
+test-integration: check-db-url
+	go test -race -tags=integration -v ./internal/repository/...
+
+## lint: golangci-lint
+lint:
+	golangci-lint run ./...
 
 tidy:
 	go mod tidy
