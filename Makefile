@@ -36,13 +36,13 @@ build: generate
 
 ## test: все unit-тесты с -race и выводом итогового покрытия domain и usecase
 test: generate
-	go test -race -coverprofile=coverage.out ./...
+	go test -race -coverpkg=./internal/domain/...,./internal/usecase/... -coverprofile=coverage.out ./...
 	@go tool cover -func=coverage.out | grep -E '(internal/domain|internal/usecase|total:)'
 	@rm -f coverage.out
 
 ## test-integration: интеграционные тесты репозитория на реальном PostgreSQL
 test-integration: check-db-url
-	go test -race -tags=integration -v ./internal/repository/...
+	go test -race -count=1 -tags=integration -v ./internal/repository/...
 
 ## lint: golangci-lint
 lint:

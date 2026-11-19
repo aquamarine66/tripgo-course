@@ -4,33 +4,34 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// Config — конфигурация сервиса, загружаемая исключительно из переменных окружения.
+// конфиг сервиса, всё читаем только из переменных окружения
 type Config struct {
 	HTTPAddr        string
 	DatabaseURL     string
 	LogLevel        string
 	ShutdownTimeout time.Duration
 
-	// Таймауты HTTP-сервера.
+	// таймауты http-сервера
 	HTTPReadTimeout       time.Duration
 	HTTPReadHeaderTimeout time.Duration
 	HTTPWriteTimeout      time.Duration
 	HTTPIdleTimeout       time.Duration
 
-	// Настройки пула соединений PostgreSQL.
+	// настройки пула подключений к postgres
 	DBMaxConns        int32
 	DBMinConns        int32
 	DBConnectTimeout  time.Duration
 	DBQueryTimeout    time.Duration
 	DBMaxConnLifetime time.Duration
 
-	// Настройки OpenTelemetry (ЛР2).
+	// настройки opentelemetry
 	OTelServiceName      string
 	OTelServiceVersion   string
 	OTelServiceNamespace string
@@ -38,9 +39,18 @@ type Config struct {
 	OTelExporterEndpoint string
 	OTelExporterProtocol string
 	OTelTracesSampler    string
+	OTelTracesSamplerArg float64
+
+	// настройки опроса устаревших поездок и гейтвея пушей
+	PositionCheckInterval time.Duration
+	PositionStaleAfter    time.Duration
+	PositionWorkers       int
+	PositionQueueSize     int
+	PushHTTPURL           string
+	PushRequestTimeout    time.Duration
 }
 
-// Load читает конфигурацию из окружения и проверяет обязательные и числовые параметры.
+// читаем переменные окружения и валидируем значения до старта сервиса
 func Load() (*Config, error) {
 	p := &parser{}
 
@@ -64,12 +74,29 @@ func Load() (*Config, error) {
 		DBMaxConnLifetime: p.duration("DATABASE_MAX_CONN_LIFETIME", 30*time.Minute),
 
 		OTelServiceName:      p.str("OTEL_SERVICE_NAME", "trip-service"),
-		OTelServiceVersion:   p.str("OTEL_SERVICE_VERSION", "0.2.0"),
+		OTelServiceVersion:   p.str("OTEL_SERVICE_VERSION", "0.3.0"),
 		OTelServiceNamespace: ns,
 		OTelEnvironment:      env,
 		OTelExporterEndpoint: os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
-		OTelExporterProtocol: p.str("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"),
-		OTelTracesSampler:    p.str("OTEL_TRACES_SAMPLER", "parentbased_always_on"),
+		OTelExporterProtocol: p.oneOf("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf", "http/protobuf", "grpc"),
+		OTelTracesSampler: p.oneOf(
+			"OTEL_TRACES_SAMPLER",
+			"parentbased_always_on",
+			"always_on",
+			"always_off",
+			"traceidratio",
+			"parentbased_always_on",
+			"parentbased_always_off",
+			"parentbased_traceidratio",
+		),
+		OTelTracesSamplerArg: p.float64Range("OTEL_TRACES_SAMPLER_ARG", 1.0, 0.0, 1.0),
+
+		PositionCheckInterval: p.duration("POSITION_CHECK_INTERVAL", 30*time.Second),
+		PositionStaleAfter:    p.duration("POSITION_STALE_AFTER", 60*time.Second),
+		PositionWorkers:       p.positiveInt("POSITION_WORKERS", 4),
+		PositionQueueSize:     p.positiveInt("POSITION_QUEUE_SIZE", 100),
+		PushHTTPURL:           p.httpURL("PUSH_HTTP_URL"),
+		PushRequestTimeout:    p.duration("PUSH_REQUEST_TIMEOUT", time.Second),
 	}
 
 	if cfg.DBMaxConns < 1 {
@@ -131,6 +158,20 @@ func (p *parser) required(key string) string {
 	return v
 }
 
+func (p *parser) httpURL(key string) string {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		p.errs = append(p.errs, fmt.Errorf("%s is required", key))
+		return ""
+	}
+	u, err := url.ParseRequestURI(v)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		p.errs = append(p.errs, fmt.Errorf("%s must be a valid http(s) URL, got %q", key, v))
+		return ""
+	}
+	return strings.TrimRight(v, "/")
+}
+
 func (p *parser) oneOf(key, def string, allowed ...string) string {
 	v := p.str(key, def)
 	for _, a := range allowed {
@@ -153,6 +194,32 @@ func (p *parser) int32(key string, def int32) int32 {
 		return def
 	}
 	return int32(n)
+}
+
+func (p *parser) positiveInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		p.errs = append(p.errs, fmt.Errorf("%s must be an integer >= 1, got %q", key, v))
+		return def
+	}
+	return n
+}
+
+func (p *parser) float64Range(key string, def, minVal, maxVal float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f < minVal || f > maxVal {
+		p.errs = append(p.errs, fmt.Errorf("%s must be a number in [%g, %g], got %q", key, minVal, maxVal, v))
+		return def
+	}
+	return f
 }
 
 func (p *parser) duration(key string, def time.Duration) time.Duration {
